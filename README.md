@@ -72,6 +72,26 @@ This repo is my attempt to glue together a few simple ideas:
 
 The point isn't to squeeze out the best possible score, but to see how these pieces interact under realistic compute and noisy safety signals.
 
+## Repository layout
+
+This is the rough structure of the code:
+
+- `src/train.py`: main training entry point (PPO, SAC, LagPPO, RCPO baseline)
+- `src/evaluate.py`: offline evaluation on the *true* environment, writes `metrics.csv`
+- `src/ablations.py`: small ablation launcher (wraps train + eval), used by `scripts/train_all.sh`
+- `src/envs/make_env.py`: environment factory (Safety-Gymnasium, optional Gymnasium-Robotics) + shield wiring
+- `src/algos/lagppo.py`: Lagrangian PPO bits (`LagrangianState`, callback)
+- `src/safety/shield.py`: geometric "keep-out" shield for 2D point/car robots
+- `src/safety/metrics.py`: helpers to aggregate returns/costs/violation rate/CVaR into tables
+- `src/reward/preferences/*`: tiny preference-learning module (data buffer, MLP reward model, wrappers)
+- `scripts/quickstart.sh`: one small LagPPO + shield run on `SafetyPointPush1-v0`
+- `scripts/train_all.sh`: runs the ablations and plots summary figures under `results/`
+
+If you're trying to hack on something:
+- **LagPPO / λ updates** start from `src/algos/lagppo.py`
+- **Shield** `src/safety/shield.py` and `src/envs/make_env.py`
+- **Preferences** `src/reward/preferences/`
+
 ## Supported Environments
 
 This project uses [**Safety-Gymnasium**](https://github.com/PKU-Alignment/Safety-Gymnasium), a benchmark library for **safe reinforcement learning (Safe RL)**.  
@@ -87,7 +107,7 @@ Main environments I'm using:
 These environments give:
 - **Reward** for doing the task (reach goal, push box, press button)  
 - **Cost** for unsafe events (stepping into hazard regions)  
-- **Budget** that algorithms like LagPPO or RCPO attempt to respec
+- **Budget** that algorithms like LagPPO or RCPO attempt to respect
 
 ## Gymnasium-Robotics Environments
 
@@ -169,6 +189,22 @@ Experiments in this repository were run on:
 Safe RL training is **computationally intensive**, especially for ablation sweeps across multiple algorithms, seeds, and hyperparameters.
 
 ## How to run training
+For a full list of options:
+
+```bash
+python -m src.train --help
+python -m src.evaluate --help
+python -m src.ablations --help
+```
+
+The most important flags:
+
+- `--env_id`: which Safety-Gymnasium env to use
+- `--algo`: `ppo`, `sac`, `lagppo`, `rcpo`
+- `--use_shield`: turn the geometric shield on
+- `--cost_budget`, `--lr_lambda`: Lagrangian CMDP hyperparams
+- `--use_preferences`, `--pref_steps`: enable the synthetic preference reward model
+
 
 Lagrangian PPO on `SafetyPointPush1-v0` with shield and cost budget:
 
@@ -320,6 +356,20 @@ To extend to Isaac Gym:
 
 - Implement a new environment factory in `src/envs/make_env.py` that returns Isaac Gym vectorized environments
 - Adapt cost signals and shields to 3D kinematics
+
+## Background reading (if you're new to Safe RL)
+
+If some of the terms above are unfamiliar (CMDP, RCPO, CVaR, preference learning), a few classic references:
+
+- Altman, *Constrained Markov Decision Processes*, 1999 - CMDP basics
+- Tessler et al., "Reward Constrained Policy Optimization", ICLR 2019 - RCPO-style methods
+- Ray et al., "Benchmarking Safe Exploration in Deep RL", NeurIPS 2019 - Safety Gym
+- Christiano et al., "Deep RL from Human Preferences", NeurIPS 2017 - preference-based reward learning
+- Ames et al., "Control Barrier Function Based Quadratic Programs for Safety Critical Systems", TAC 2019 - safety via barrier functions
+
+The repo is not trying to reproduce their results, but it borrows a lot of ideas from that literature.
+
+Also, I greatly encourage you to explore [**Safety-Gymnasium**](https://github.com/PKU-Alignment/Safety-Gymnasium).
 
 ## Citation
 
