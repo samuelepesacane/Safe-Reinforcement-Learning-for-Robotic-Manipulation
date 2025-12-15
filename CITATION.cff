@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "Constrained Exploration for Robotic Manipulation with Lagrangian PPO and Action Shielding"
+authors:
+  - family-names: "Pesacane"
+    given-names: "Samuele"
+  - name: "et al."
+date-released: 2025-01-01
+version: "1.0.0"
+repository-code: "https://github.com/your-org/safe-rl-manipulation"
+message: "If you use this software, please cite it using this metadata."
+keywords:
+  - reinforcement learning
+  - robotics
+  - safety
+  - constrained MDP
+  - Lagrangian PPO
+  - action shielding

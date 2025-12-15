@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.venv/
+.env/
+.envrc
+.DS_Store
+
+# Logs and outputs
+logs/
+runs/
+videos/
+results/
+checkpoints/
+
+# IDE
+.vscode/
+.idea/

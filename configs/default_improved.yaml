@@ -1,0 +1,31 @@
+env:
+  suite: safety_gymnasium
+  id: SafetyPointPush1-v0
+  kwargs:
+    hazard_num: 8
+    time_limit: 1000
+
+safety:
+  budget: 0.05
+  metric: avg_cost
+  shield:
+    enabled: true
+    type: keepout
+    margin: 0.1
+
+algo:
+  name: lagppo
+  policy_lr: 3e-4
+  dual_lr: 5e-4
+  init_lambda: 0.5
+  lambda_max: 100.0
+
+train:
+  total_timesteps: 300000
+  num_envs: 4
+  seed: 0
+  eval_freq: 10000
+  eval_episodes: 20
+
+# NEED TO BE TESTED
+# IT IS AN UPGRADE FOR THE ENV FILES BUT STILL IN DEVELOP PHASE

@@ -1,0 +1,7 @@
+env_id: FetchPush-v2
+algo: ppo
+total_timesteps: 300000
+num_envs: 4
+seed: 0
+use_shield: false
+eval_freq: 10000

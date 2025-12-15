@@ -1,0 +1,10 @@
+# Default hyperparameters (reference only; not auto-loaded)
+env_id: SafetyPointPush1-v0
+algo: lagppo
+total_timesteps: 200000
+num_envs: 4
+seed: 0
+cost_budget: 0.05
+lr_lambda: 0.0005
+use_shield: true
+eval_freq: 10000
