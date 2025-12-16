@@ -157,7 +157,7 @@ This will:
 - **MuJoCo**: `mujoco>=2.3` is installed via `pip`, but MuJoCo **system dependencies** must be installed separately depending on your OS. See:
   [https://github.com/google-deepmind/mujoco](https://github.com/google-deepmind/mujoco)
 - **GPU**: Optional; PyTorch will use CUDA if available (Good luck without GPU)
-- **Isaac Gym**: not required (see “Notes for Isaac Gym” below)
+- **Other simulators (e.g. Isaac Lab)**: not used here. This repo currently targets MuJoCo + Gymnasium only.
 
 ## Installation
 
@@ -348,14 +348,17 @@ Current limitations:
 - Validation on Gymnasium-Robotics environments (e.g. FetchPush-v2)
 - Extended evaluation on additional Safety-Gymnasium tasks and robotics simulators
 
-## Notes for Isaac Gym (optional)
+## Notes on other simulators (e.g. Isaac Lab)
 
-This repository currently targets **MuJoCo / Gymnasium** first. Isaac Gym support is **not required** to run the experiments.
+Right now everything in this repo is built around **MuJoCo + Gymnasium / Safety-Gymnasium**.
 
-To extend to Isaac Gym:
+If you want to experiment with other simulators (e.g. Isaac Lab), the rough steps would be:
 
-- Implement a new environment factory in `src/envs/make_env.py` that returns Isaac Gym vectorized environments
-- Adapt cost signals and shields to 3D kinematics
+- add a new environment factory in `src/envs/make_env.py` that creates vectorized Isaac Lab environments;
+- make sure they expose rewards, costs, and any safety signals in a way that matches the current interfaces;
+- adapt the shield code if you move from 2D point/car robots to full 3D manipulators.
+
+This is not implemented yet. At the moment, consider it a "future experiment" rather than an advertised feature.
 
 ## Background reading (if you're new to Safe RL)
 
