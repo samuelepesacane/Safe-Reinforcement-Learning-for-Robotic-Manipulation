@@ -339,13 +339,40 @@ Current limitations:
 - **Environment not found**: double-check the exact Safety-Gymnasium env ID and package version
 - **CUDA / GPU issues**: if you hit CUDA version mismatches, you can force CPU with `CUDA_VISIBLE_DEVICES=""` or pass `--device cpu`
 
-## Future Updates
+## Future updates
 
-- Checkpointing and resume from intermediate states
+This repo is still very much a work in progress. Roughly in order of pain points:
+
+- **LagPPO stability and defaults**
+  - Do a more systematic sweep over `--cost_budget` and `--lr_lambda` (and clipping) instead of guessing.
+  - Save a couple of "good enough" default configs per env (YAML) so people don't have to rediscover them.
+
+- **Shield logging and evaluation**
+  - Fix the intervention logging bug so every modified action is actually counted (right now plots lie).
+  - Add a few targeted tests (boundary cases, multiple hazards) and one small experiment comparing:
+    - no shield
+    - shield only
+    - LagPPO only
+    - LagPPO + shield
+
+- **Preference pipeline cleanup**
+  - Make the synthetic preference code less hacky (segment length, sampling, etc. as flags).
+  - Add a small script/notebook to check how the learned reward correlates with env reward/cost.
+  - Longer term: plug in real human preferences instead of only synthetic labels.
+
+- **Environment coverage and configs**
+  - Properly test and document which environments are supported (Point/Button/Car + FetchPush-v2).
+  - Add small config files per env (seeds, horizon, budgets, shield settings) so runs are reproducible.
+
+- **Training / tooling quality of life**
+  - Add checkpointing + resume (including Lagrange multiplier state).
+  - Improve logging: make it easier to see rewards, costs, λ, and shield interventions in one place.
+  - Add a few more unit tests (Lagrangian update, shield projection, preference loss) and maybe a tiny Continuous Integration (CI) job.
+
+### Longer-term ideas (if/when compute allows)
+
 - Memory optimization for large-batch or long-horizon runs
-- Preference learning: beyond synthetic preferences, with improved query strategies
 - Distributed training over multiple GPUs or nodes
-- Validation on Gymnasium-Robotics environments (e.g. FetchPush-v2)
 - Extended evaluation on additional Safety-Gymnasium tasks and robotics simulators
 
 ## Notes on other simulators (e.g. Isaac Lab)
@@ -354,9 +381,9 @@ Right now everything in this repo is built around **MuJoCo + Gymnasium / Safety-
 
 If you want to experiment with other simulators (e.g. Isaac Lab), the rough steps would be:
 
-- add a new environment factory in `src/envs/make_env.py` that creates vectorized Isaac Lab environments;
-- make sure they expose rewards, costs, and any safety signals in a way that matches the current interfaces;
-- adapt the shield code if you move from 2D point/car robots to full 3D manipulators.
+- add a new environment factory in `src/envs/make_env.py` that creates vectorized Isaac Lab environments
+- make sure they expose rewards, costs, and any safety signals in a way that matches the current interfaces
+- adapt the shield code if you move from 2D point/car robots to full 3D manipulators
 
 This is not implemented yet. At the moment, consider it a "future experiment" rather than an advertised feature.
 
