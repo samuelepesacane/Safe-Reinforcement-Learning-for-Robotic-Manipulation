@@ -6,7 +6,7 @@ authors:
   - name: "et al."
 date-released: 2025-01-01
 version: "1.0.0"
-repository-code: "https://github.com/your-org/safe-rl-manipulation"
+repository-code: "https://github.com/samuelepesacane/Safe-Reinforcement-Learning-for-Robotic-Manipulation"
 message: "If you use this software, please cite it using this metadata."
 keywords:
   - reinforcement learning
