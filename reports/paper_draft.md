@@ -37,36 +37,36 @@ The goal is not a new Safe RL algorithm, but rather to see how these ingredients
 
 A CMDP augments the usual MDP with a cost and a constraint:
 
-- State space \( \mathcal{S} \), action space \( \mathcal{A} \), transition kernel \( P \), reward \( r(s,a) \).
-- A **cost** function \( c(s,a) \geq 0 \) measuring safety violations.
-- The agent maximizes expected discounted return \( \mathbb{E}[\sum_t \gamma^t r_t] \) subject to
-  \[
+- State space $ \mathcal{S} $, action space $ \mathcal{A} $, transition kernel $ P $, reward $ r(s,a) $.
+- A **cost** function $ c(s,a) \geq 0 $ measuring safety violations.
+- The agent maximizes expected discounted return $ \mathbb{E}[\sum_t \gamma^t r_t] $ subject to
+  $$
   \mathbb{E}\left[\sum_t \gamma^t c_t\right] \leq d,
-  \]
-  where \( d \) is a cost budget.
+  $$
+  where $ d $ is a cost budget.
 
 A common trick is to form the Lagrangian
-\[
+$$
 \mathcal{L}(\pi, \lambda) = \mathbb{E}\left[ \sum_t \gamma^t \big(r_t - \lambda c_t\big) \right] + \lambda d,
-\]
-and alternate between improving the policy under a **shaped reward** \( r' = r - \lambda c \) and updating the dual variable \( \lambda \) based on how much the constraint is violated.
+$$
+and alternate between improving the policy under a **shaped reward** $ r' = r - \lambda c $ and updating the dual variable $ \lambda $ based on how much the constraint is violated.
 
-In code, this becomes "run PPO on \( r' \)" plus "every so often, look at the average cost and nudge \(\lambda\) up or down".
+In code, this becomes "run PPO on $ r' $" plus "every so often, look at the average cost and nudge $\lambda$ up or down".
 
 ### 2.2 Lagrangian Methods for Safe RL
 
 In practice I use PPO as the base algorithm and update the Lagrange multiplier using an empirical average cost:
 
-\[
+$$
 \lambda \leftarrow \max\left( 0, \lambda + \alpha \big(\hat{c} - d\big) \right),
-\]
+$$
 
-where \( \hat{c} \) is the average per-step cost over the last rollout, \( d \) is the target per-step budget, and \( \alpha \) is a dual learning rate.
+where $ \hat{c} $ is the average per-step cost over the last rollout, $ d $ is the target per-step budget, and $ \alpha $ is a dual learning rate.
 
-- If the agent is too unsafe (\( \hat{c} > d \)), \(\lambda\) increases and cost gets penalized more strongly.
-- If the agent is below budget, \(\lambda\) tends to decrease towards zero.
+- If the agent is too unsafe ($ \hat{c} > d $), $\lambda$ increases and cost gets penalized more strongly.
+- If the agent is below budget, $\lambda$ tends to decrease towards zero.
 
-In the current implementation, I found that the method is **quite sensitive** to both \( \alpha \) and the choice of budget \( d \). Too aggressive \( \alpha \) or too tight a budget often makes \(\lambda\) "chase" the constraint and destabilize training.
+In the current implementation, I found that the method is **quite sensitive** to both $ \alpha $ and the choice of budget $ d $. Too aggressive $ \alpha $ or too tight a budget often makes $\lambda$ "chase" the constraint and destabilize training.
 
 ### 2.3 Action Shielding
 
@@ -75,10 +75,10 @@ Lagrangian methods work on **expected** cost. They do not directly stop individu
 - The shield stores circular hazard regions in the workspace.
 - From the observation it extracts the robot's 2D position.
 - For a proposed action (treated as a 2D velocity), it predicts the next position:
-  \[
+  $$
   x_{\text{next}} = x + \Delta t \, a_{xy}.
-  \]
-- If \( x_{\text{next}} \) lands inside a hazard disc, the shield rescales the action along its direction so that the next position lies just outside the hazard boundary.
+  $$
+- If $ x_{\text{next}} $ lands inside a hazard disc, the shield rescales the action along its direction so that the next position lies just outside the hazard boundary.
 
 This is very local and approximate: it doesn't model real dynamics or long-term safety, but it can cut down on "drive straight into the hazard" behavior early in training.
 
@@ -105,40 +105,40 @@ Right now the labels are fully synthetic, so this is more about testing the plum
 LagPPO in this repo is implemented by combining Stable-Baselines3 PPO with a small `LagrangianState` helper:
 
 - The environment exposes a scalar cost in `info["cost"]`.
-- Over each rollout of length \( T \), we compute
-  \[
+- Over each rollout of length $ T $, we compute
+  $$
   \hat{c} = \frac{1}{T} \sum_{t=1}^T c_t.
-  \]
+  $$
 - The Lagrange multiplier is updated via
-  \[
+  $$
   \lambda \leftarrow \max\big(0, \lambda + \alpha (\hat{c} - d)\big),
-  \]
+  $$
   with simple clipping to avoid numerical explosion.
 
 The shaped reward passed to PPO is
-\[
+$$
 r'_t = r_t - \lambda c_t.
-\]
+$$
 
-`LagrangianState` stores \(\lambda\), the learning rate \(\alpha\), the budget \(d\), and an update cadence (roughly the rollout length). A callback periodically:
+`LagrangianState` stores $\lambda$, the learning rate $\alpha$, the budget $d$, and an update cadence (roughly the rollout length). A callback periodically:
 
 - reads average cost from recent transitions,
-- updates \(\lambda\),
+- updates $\lambda$,
 - logs both the updated multiplier and the observed costs.
 
-> **Note:** in some runs, very tight budgets plus high \(\alpha\) lead to oscillatory or unstable behavior. I haven't tuned this thoroughly yet.
+> **Note:** in some runs, very tight budgets plus high $\alpha$ lead to oscillatory or unstable behavior. I haven't tuned this thoroughly yet.
 
 ### 3.2 Geometric Keepout Shield
 
 The `GenericKeepoutShield` sits next to the environment and modifies actions before they hit the simulator:
 
-- It keeps a list of hazard discs \((x_i, y_i, r_i)\).
+- It keeps a list of hazard discs $(x_i, y_i, r_i)$.
 - It reads a 2D position from the observation (e.g. `"agent_pos"`).
-- For action \( a \), it uses the first two components \( a_{xy} \) and predicts:
-  \[
+- For action $ a $, it uses the first two components $ a_{xy} $ and predicts:
+  $$
   x_{\text{next}} = x + \Delta t \, a_{xy}.
-  \]
-- If this point is inside a hazard disc, it scales the action by a factor \( t \in [0, 1] \) found via a small 1D search so that the next position sits just outside the disc.
+  $$
+- If this point is inside a hazard disc, it scales the action by a factor $ t \in [0, 1] $ found via a small 1D search so that the next position sits just outside the disc.
 
 This is meant to be a cheap, "don't step into the lava" style mechanism, not a safety guarantee. Shields are attached via `make_env`, and the environment is expected to record an intervention flag so we can count how often the shield acts.
 
@@ -163,10 +163,10 @@ The main training script is `src/train.py`:
 - Driven by CLI flags: `--algo {ppo,sac,lagppo,rcpo}`, `--env_id`, `--use_shield`, `--cost_budget`, `--lr_lambda`, `--use_preferences`, etc.
 - Uses vectorized environments (Dummy/SubprocVecEnv) with a shared Lagrange multiplier for LagPPO across workers.
 - RCPO is currently implemented as a fixed-penalty wrapper:
-  \[
+  $$
   r'_t = r_t - \beta c_t
-  \]
-  with a constant \(\beta\) from the CLI.
+  $$
+  with a constant $\beta$ from the CLI.
 - Logging is done via a custom JSON/TensorBoard logger.
 
 Evaluation is in `src/evaluate.py`, which:
@@ -195,8 +195,8 @@ The code supports four variants:
 
 - **PPO:** standard baseline, no cost.
 - **SAC:** off-policy baseline with entropy regularization.
-- **RCPO baseline:** PPO with fixed penalty \( r' = r - \beta c \).
-- **LagPPO:** PPO with Lagrangian cost shaping and dual updates on \(\lambda\).
+- **RCPO baseline:** PPO with fixed penalty $ r' = r - \beta c $.
+- **LagPPO:** PPO with Lagrangian cost shaping and dual updates on $\lambda$.
 
 All share the same basic MLP architecture and mostly default SB3 hyperparameters. The idea is to keep the backbone fixed and change only how costs are handled.
 
@@ -204,7 +204,7 @@ All share the same basic MLP architecture and mostly default SB3 hyperparameters
 
 Typical settings (subject to change as I iterate):
 
-- Training steps: usually in the \( 1\text{e}5\)-\(3\text{e}5\) range per run.
+- Training steps: usually in the $ 1\text{e}5$-$3\text{e}5$ range per run.
 - Up to 4 parallel envs.
 - 3-5 random seeds for ablations under ideal conditions; fewer seeds for quick tests.
 - Hardware: single PC, RTX 3070 (8GB), WSL2 + Ubuntu.
@@ -241,10 +241,10 @@ All metrics are computed on the **unshaped environment**, i.e., no extra penalti
 The exact numbers depend on the run, but, across multiple experiments, a few patterns keep showing up:
 
 - **LagPPO vs PPO:**  
-  LagPPO usually lowers cost and violation rate compared to plain PPO, especially with moderate budgets. Returns are sometimes slightly worse but not catastrophic. When \(\alpha\) or the budget are badly chosen, things can go sideways (see the tight-budget ablations).
+  LagPPO usually lowers cost and violation rate compared to plain PPO, especially with moderate budgets. Returns are sometimes slightly worse but not catastrophic. When $\alpha$ or the budget are badly chosen, things can go sideways (see the tight-budget ablations).
 
 - **RCPO baseline:**  
-  With a small penalty, RCPO behaves almost like PPO (unsafe). With a large penalty, it becomes very conservative and sacrifices most return. There is no obvious "right" \(\beta\), and I did not do a full sweep. LagPPO's adaptive \(\lambda\) feels nicer conceptually, but still requires careful tuning.
+  With a small penalty, RCPO behaves almost like PPO (unsafe). With a large penalty, it becomes very conservative and sacrifices most return. There is no obvious "right" $\beta$, and I did not do a full sweep. LagPPO's adaptive $\lambda$ feels nicer conceptually, but still requires careful tuning.
 
 - **Shielding:**  
   Qualitatively, the shield helps prevent "drive straight through the hazard" behavior, especially early. Quantitatively, the current intervention logging is not reliable enough to claim strong results here, so I treat this as a promising, but not fully measured, piece.
@@ -259,8 +259,8 @@ The exact numbers depend on the run, but, across multiple experiments, a few pat
 The ablation driver (`src/ablations.py` + `scripts/train_all.sh`) explores:
 
 1. **Shield on/off (LagPPO):** how much the geometric shield changes early violations and final safety metrics.
-2. **Dual learning rate \(\alpha\):** values in roughly \(\{1\text{e}{-4}, 5\text{e}{-4}, 1\text{e}{-3}\}\), to see how quickly constraints are enforced vs how unstable training becomes.
-3. **Cost budget \(d\):** tight (0.01), moderate (0.05), loose (0.1) budgets.
+2. **Dual learning rate $\alpha$:** values in roughly $\{1\text{e}{-4}, 5\text{e}{-4}, 1\text{e}{-3}\}$, to see how quickly constraints are enforced vs how unstable training becomes.
+3. **Cost budget $d$:** tight (0.01), moderate (0.05), loose (0.1) budgets.
 4. **Preference vs environment reward:** same setup, but training on a learned reward instead of the original ones.
 5. **Algorithm comparison:** PPO, SAC, RCPO baseline, LagPPO.
 
