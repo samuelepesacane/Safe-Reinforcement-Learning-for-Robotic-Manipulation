@@ -1,4 +1,4 @@
-# Constrained Exploration for Robotic Manipulation with Lagrangian PPO and Action Shielding
+# Safe Reinforcement Learning for Robotic Manipulation (Draft)
 
 **Author:** Samuele Pesacane
 
@@ -6,315 +6,358 @@
 
 ## Abstract
 
-This is a small Safe RL project on MuJoCo-style control tasks using Safety-Gymnasium.  
-I combine a constrained MDP approach (Lagrangian PPO with an average cost budget), a simple geometric action shield that tries to keep the agent out of hazard regions, and a tiny preference-based reward model trained from synthetic segment comparisons.
+In this project I built an open-source framework for safe reinforcement learning in robotic control / robotic manipulation-style settings, mainly on top of Safety-Gymnasium. The goal was not to invent a new algorithm, but to put the main pieces in one place and actually test how they behave together under realistic constraints (limited compute, short runs, noisy safety signals).
 
-The code includes PPO, SAC, a fixed-penalty RCPO-style baseline, and Lagrangian PPO (LagPPO), plus some safety-aware metrics and ablation scripts.  
-On the SafetyPoint tasks I tried so far, LagPPO plus shielding tends to reduce constraint violations and cost CVaR while keeping returns in a reasonable range, although the results are noisy and definitely not "state of the art". This draft is mostly a record of what I implemented and what I observed, not a final paper.
+The framework includes PPO, SAC, a simple RCPO-style fixed-penalty baseline, and Lagrangian PPO (LagPPO) in a unified training/evaluation pipeline. On top of that, I added a conservative geometric action shield (to push actions away from predicted hazard incursions) and a small preference-based reward learning module (synthetic preferences for now, mainly as a prototype).
+
+The main result from my ablations is not "everything is solved" (it is not). It is more like: the theory is nice, but in practice safety-performance tradeoffs show up very quickly. In particular, across my short-horizon runs, SAC was often more conservative than PPO and LagPPO (lower average cost / violation rate), and changing the cost budget / dual learning rate had a very strong effect on whether LagPPO behaved sensibly or just oscillated. This is exactly the kind of thing I wanted to study: how safety guarantees get weaker once function approximation, finite samples, and imperfect environment models enter the picture.
 
 ---
 
 ## 1. Introduction
 
-Reinforcement learning can do very well in simulation, but getting a learned policy to behave sensibly on a real robot is another story. Exploration can break hardware, collide with things, or just behave in ways you wouldn't want around humans. Standard RL optimizes expected return and doesn't care *how* the agent gets that reward, as long as the numbers go up.
+Safe RL is one of the main bottlenecks if we want RL to be useful for real robots.
 
-Constrained Markov decision processes (CMDPs) offer one standard way to handle this: you get both a reward and a cost, and you try to keep the cost under some budget. In theory this gives you "optimal and safe" behavior; in practice, especially with function approximation and limited compute, constraints are often violated during training and sometimes even at convergence.
+In simulation, the agent can explore badly and nobody cares. On hardware, "exploration" can mean collisions, unsafe motions, wear on components, or just behavior that is too unreliable to trust. Standard RL only cares about maximizing return. It does not care whether the agent reached the goal safely or by doing something reckless ten times before it got lucky.
 
-In this project I played with a small Safe RL stack for robotic-style control, built around three pieces:
+This repo is my attempt to build a small but usable safe RL playground where I can study that tradeoff directly.
 
-1. **Lagrangian PPO (LagPPO):** PPO with a Lagrange multiplier on the cost and dual updates that try to enforce a cost budget.
-2. **Geometric action shielding:** a 2D "keep-out" projection that tries to prevent the agent from stepping into hazard discs.
-3. **Preference-based reward learning:** a simple reward model trained from pairwise segment comparisons (synthetic for now).
+The idea was to combine a few simple ingredients:
 
-Everything runs on Safety-Gymnasium (e.g. `SafetyPointPush1-v0`) with Stable-Baselines3 (PPO, SAC) as backbones.  
-The goal is not a new Safe RL algorithm, but rather to see how these ingredients interact under realistic constraints (single machine, limited GPU, noisy safety signals) and to have a codebase I can iterate on.
+1. **Constrained RL (CMDP style)** with a Lagrangian multiplier  
+   (so the agent gets reward, but also pays for unsafe behavior)
 
----
+2. **A geometric keep-out shield**  
+   (so obviously unsafe actions can be corrected before they hit the environment)
 
-## 2. Background
+3. **Preference-based reward learning**  
+   (so I can later replace hand-designed reward with something learned from comparisons)
 
-### 2.1 Constrained Markov Decision Processes
+I built everything around **Safety-Gymnasium**, because it already gives me the right setup: task reward + safety cost (hazard incursions), which is perfect for constrained RL experiments.
 
-A CMDP augments the usual MDP with a cost and a constraint:
-
-- State space $ \mathcal{S} $, action space $ \mathcal{A} $, transition kernel $ P $, reward $ r(s,a) $.
-- A **cost** function $ c(s,a) \geq 0 $ measuring safety violations.
-- The agent maximizes expected discounted return $ \mathbb{E}[\sum_t \gamma^t r_t] $ subject to
-  $$
-  \mathbb{E}\left[\sum_t \gamma^t c_t\right] \leq d,
-  $$
-  where $ d $ is a cost budget.
-
-A common trick is to form the Lagrangian
-$$
-\mathcal{L}(\pi, \lambda) = \mathbb{E}\left[ \sum_t \gamma^t \big(r_t - \lambda c_t\big) \right] + \lambda d,
-$$
-and alternate between improving the policy under a **shaped reward** $ r' = r - \lambda c $ and updating the dual variable $ \lambda $ based on how much the constraint is violated.
-
-In code, this becomes "run PPO on $ r' $" plus "every so often, look at the average cost and nudge $\lambda$ up or down".
-
-### 2.2 Lagrangian Methods for Safe RL
-
-In practice I use PPO as the base algorithm and update the Lagrange multiplier using an empirical average cost:
-
-$$
-\lambda \leftarrow \max\left( 0, \lambda + \alpha \big(\hat{c} - d\big) \right),
-$$
-
-where $ \hat{c} $ is the average per-step cost over the last rollout, $ d $ is the target per-step budget, and $ \alpha $ is a dual learning rate.
-
-- If the agent is too unsafe ($ \hat{c} > d $), $\lambda$ increases and cost gets penalized more strongly.
-- If the agent is below budget, $\lambda$ tends to decrease towards zero.
-
-In the current implementation, I found that the method is **quite sensitive** to both $ \alpha $ and the choice of budget $ d $. Too aggressive $ \alpha $ or too tight a budget often makes $\lambda$ "chase" the constraint and destabilize training.
-
-### 2.3 Action Shielding
-
-Lagrangian methods work on **expected** cost. They do not directly stop individual unsafe actions from being executed. To reduce the most obvious failures, I added a simple **geometric action shield** for 2D robots:
-
-- The shield stores circular hazard regions in the workspace.
-- From the observation it extracts the robot's 2D position.
-- For a proposed action (treated as a 2D velocity), it predicts the next position:
-  $$
-  x_{\text{next}} = x + \Delta t \, a_{xy}.
-  $$
-- If $ x_{\text{next}} $ lands inside a hazard disc, the shield rescales the action along its direction so that the next position lies just outside the hazard boundary.
-
-This is very local and approximate: it doesn't model real dynamics or long-term safety, but it can cut down on "drive straight into the hazard" behavior early in training.
-
-> **TODO:** right now, shield intervention logging is buggy in some runs (often flat zero), so the plots underestimate how often the shield actually fires.
-
-### 2.4 Preference-Based Reward Learning
-
-Reward design is another source of problems. For this project I implemented a basic **preference-based reward learning** module, mostly as a hook for future human feedback:
-
-1. Collect trajectories from a random policy.
-2. Sample pairs of short segments (e.g. 25 steps each).
-3. Assign a synthetic label: the segment with higher cumulative environment reward is "preferred".
-4. Train a small MLP that maps observations to a scalar reward, using a Bradley-Terry loss so that preferred segments get higher predicted cumulative reward.
-5. Wrap the environment so that training uses the learned reward instead of the original one.
-
-Right now the labels are fully synthetic, so this is more about testing the plumbing than about real human alignment. In experiments with limited data and short training, the learned reward can be quite noisy and doesn't always help.
+This is still a draft-stage project. The code path works end-to-end, but the point right now is not leaderboard performance. The point is to understand what breaks, what helps, and what is too sensitive to trust without more tuning.
 
 ---
 
-## 3. Method
+## 2. What I implemented
 
-### 3.1 Lagrangian PPO (LagPPO)
+### 2.1 Unified training/evaluation framework
 
-LagPPO in this repo is implemented by combining Stable-Baselines3 PPO with a small `LagrangianState` helper:
+I wanted one codebase where I could swap algorithms and safety components without rewriting everything each time.
 
-- The environment exposes a scalar cost in `info["cost"]`.
-- Over each rollout of length $ T $, we compute
-  $$
-  \hat{c} = \frac{1}{T} \sum_{t=1}^T c_t.
-  $$
-- The Lagrange multiplier is updated via
-  $$
-  \lambda \leftarrow \max\big(0, \lambda + \alpha (\hat{c} - d)\big),
-  $$
-  with simple clipping to avoid numerical explosion.
+So the framework has:
 
-The shaped reward passed to PPO is
+- **PPO** (baseline)
+- **SAC** (baseline)
+- **RCPO-style baseline** (currently a fixed cost penalty, not a full RCPO implementation)
+- **Lagrangian PPO (LagPPO)**
+
+and one shared pipeline for:
+
+- training
+- checkpointing
+- logging
+- evaluation
+- ablation runs
+- plotting
+
+This sounds simple, but this was actually a big part of the work: making wrappers, logging, and evaluation consistent enough that I can compare methods without constantly patching the scripts.
+
+---
+
+### 2.2 Lagrangian PPO (LagPPO)
+
+The constrained RL part follows the standard CMDP / Lagrangian idea.
+
+The agent maximizes reward while trying to respect a cost budget. In practice, I shape the reward as:
+
 $$
-r'_t = r_t - \lambda c_t.
+r'_t = r_t - \lambda c_t
 $$
 
-`LagrangianState` stores $\lambda$, the learning rate $\alpha$, the budget $d$, and an update cadence (roughly the rollout length). A callback periodically:
+where:
 
-- reads average cost from recent transitions,
-- updates $\lambda$,
-- logs both the updated multiplier and the observed costs.
+- $r_t$ = task reward
+- $c_t$ = safety cost (from Safety-Gymnasium, e.g. entering hazard zones)
+- $\lambda$ = Lagrange multiplier (updated online)
 
-> **Note:** in some runs, very tight budgets plus high $\alpha$ lead to oscillatory or unstable behavior. I haven't tuned this thoroughly yet.
+The dual update is:
 
-### 3.2 Geometric Keepout Shield
+$$
+\lambda \leftarrow \max(0,\ \lambda + \alpha(\hat{c} - d))
+$$
 
-The `GenericKeepoutShield` sits next to the environment and modifies actions before they hit the simulator:
+where:
 
-- It keeps a list of hazard discs $(x_i, y_i, r_i)$.
-- It reads a 2D position from the observation (e.g. `"agent_pos"`).
-- For action $ a $, it uses the first two components $ a_{xy} $ and predicts:
-  $$
-  x_{\text{next}} = x + \Delta t \, a_{xy}.
-  $$
-- If this point is inside a hazard disc, it scales the action by a factor $ t \in [0, 1] $ found via a small 1D search so that the next position sits just outside the disc.
+- $\hat{c}$ is the empirical **average per-step cost** over a rollout window
+- $d$ is the target per-step cost budget
+- $\alpha$ is the dual learning rate
 
-This is meant to be a cheap, "don't step into the lava" style mechanism, not a safety guarantee. Shields are attached via `make_env`, and the environment is expected to record an intervention flag so we can count how often the shield acts.
+So the logic is:
 
-> **TODO:** intervention logging is not fully consistent across all wrappers yet; this is visible in ablation plots where interventions ~= 0 even when the shield should be doing something.
+- if the policy is too unsafe, $\lambda$ goes up (cost hurts more)
+- if the policy stays below budget, $\lambda$ can go down
 
-### 3.3 Preference-Based Reward Model
+In code, this is implemented with a small `LagrangianState` helper + a callback that reads costs from `info["cost"]`, updates $\lambda$, and logs both cost and multiplier over time.
 
-The preference-learning pipeline follows a standard pattern, but at a small scale:
-
-1. **Random rollouts:** collect trajectories of `(obs, action, reward)` from a random policy.
-2. **Segments:** break trajectories into fixed-length segments (e.g. 25 steps).
-3. **Pairs + labels:** sample pairs of segments and label the one with higher cumulative reward as preferred.
-4. **Reward network:** train a small MLP on flattened observations with a Bradley-Terry style loss so that preferred segments get higher predicted cumulative reward.
-5. **Wrapper:** during training, use a `RewardReplacementWrapper` to replace environment reward with the learned reward at each step.
-
-In the current experiments, this mostly serves as a "toy" preference model. With the limited number of segments and short runs, it doesn't reliably improve safety or performance, but it shows how a proper human-in-the-loop module could plug in later.
-
-### 3.4 Overall System and Implementation
-
-The main training script is `src/train.py`:
-
-- Driven by CLI flags: `--algo {ppo,sac,lagppo,rcpo}`, `--env_id`, `--use_shield`, `--cost_budget`, `--lr_lambda`, `--use_preferences`, etc.
-- Uses vectorized environments (Dummy/SubprocVecEnv) with a shared Lagrange multiplier for LagPPO across workers.
-- RCPO is currently implemented as a fixed-penalty wrapper:
-  $$
-  r'_t = r_t - \beta c_t
-  $$
-  with a constant $\beta$ from the CLI.
-- Logging is done via a custom JSON/TensorBoard logger.
-
-Evaluation is in `src/evaluate.py`, which:
-
-- loads the SB3 checkpoint (PPO or SAC),
-- runs deterministic rollouts on the *raw* environment (no shaping, no shield),
-- aggregates safety-aware metrics into a small `metrics.csv`.
+One thing I saw very clearly: **LagPPO is sensitive** to the budget and to the dual LR. If the budget is too tight or $\alpha$ is too aggressive, the multiplier can overreact and training becomes unstable instead of safer.
 
 ---
 
-## 4. Experimental Setup
+### 2.3 Geometric action shield (keep-out shield)
 
-### 4.1 Environments
+Lagrangian methods work in expectation, which is useful, but they do not stop a single obviously bad action.
 
-Main environments from Safety-Gymnasium:
+So I added a simple geometric shield for 2D Safety-Gym tasks:
 
-- **SafetyPointPush1-v0:** point robot pushes a box to a target while avoiding hazards.
-- **SafetyPointButton1-v0:** point robot must reach and press a button with hazards in between.
-- **SafetyCarPush1-v0 (optional):** car-like robot with differential drive dynamics and hazard regions.
+- it stores hazard regions as circles
+- reads the agent's 2D position from the observation
+- treats the action as a local velocity command
+- predicts the next position
+- if the predicted next position enters a hazard, it rescales / projects the action so the agent stays just outside the hazard boundary
 
-There is also a config for **FetchPush-v2** (Gymnasium-Robotics), which has no cost signals. It's mainly there as a possible extension for "pure task" manipulation experiments; I haven't really used it in the current Safe RL runs.
+This is intentionally simple. It is not a formal safety guarantee and it does not model long-horizon dynamics. It is basically a "don't step straight into the hazard" filter.
 
-### 4.2 Algorithms and Baselines
+I like this design because it is cheap and easy to reason about. It is also a nice extension point if I want to test something more advanced later (barrier-function style shields, learned forward models, etc.).
 
-The code supports four variants:
-
-- **PPO:** standard baseline, no cost.
-- **SAC:** off-policy baseline with entropy regularization.
-- **RCPO baseline:** PPO with fixed penalty $ r' = r - \beta c $.
-- **LagPPO:** PPO with Lagrangian cost shaping and dual updates on $\lambda$.
-
-All share the same basic MLP architecture and mostly default SB3 hyperparameters. The idea is to keep the backbone fixed and change only how costs are handled.
-
-### 4.3 Training Protocol
-
-Typical settings (subject to change as I iterate):
-
-- Training steps: usually in the $ 1\text{e}5$-$3\text{e}5$ range per run.
-- Up to 4 parallel envs.
-- 3-5 random seeds for ablations under ideal conditions; fewer seeds for quick tests.
-- Hardware: single PC, RTX 3070 (8GB), WSL2 + Ubuntu.
-
-There's a `scripts/quickstart.sh` script that runs a small LagPPO + shield experiment on `SafetyPointPush1-v0`, evaluates it, and makes some plots. This is mostly a smoke test.
-
-> **Note:** long runs with many seeds can easily hit memory or time limits on this setup, so some ablations are intentionally small.
+One issue I still need to clean up: **intervention logging is not fully reliable yet** in some wrapper combinations, so the shield stats in the plots are not always trustworthy.
 
 ---
 
-## 5. Metrics
+### 2.4 Preference-based reward learning (prototype)
 
-Per episode, I record:
+I also added a small preference-learning module because I wanted the framework to support "reward is learned" experiments, not only hand-designed rewards.
 
-- **Return:** sum of environment rewards.
-- **Cost:** sum of safety costs.
-- **Violation rate:** how often cost is non-zero (per step or per episode).
-- **Length:** episode length in steps.
-- **Shield interventions:** how many actions were modified by the shield.
-- **Success:** whether the task goal was achieved (when available).
+Right now it works like this:
 
-The module `src/safety/metrics.py` turns these into:
+1. collect random trajectories
+2. split them into short segments
+3. sample segment pairs
+4. create **synthetic preferences** (the segment with higher env return is preferred)
+5. train a small MLP reward model with a Bradley-Terry style loss
+6. replace the environment reward with the learned reward during RL training
 
-- averages and standard deviations,
-- CVaR-style tail costs (e.g. mean of top 10% highest-cost episodes),
-- simple tables for plotting and comparison.
+At this stage, this is mostly a **plumbing prototype**, not a polished human-feedback pipeline. Since the labels are synthetic and runs are short, the learned reward is often just a noisy approximation of the environment reward.
 
-All metrics are computed on the **unshaped environment**, i.e., no extra penalties and, for now, no shield during evaluation. This is important: shaping and shielding are training-time tools, not how we judge final behavior.
+Still, I wanted this in the repo now because later I can swap the synthetic labels with real preferences without changing the whole training loop.
 
 ---
 
-## 6. Results (Qualitative Summary)
+## 3. Environments and setup
 
-The exact numbers depend on the run, but, across multiple experiments, a few patterns keep showing up:
+The main experiments use **Safety-Gymnasium**, especially:
 
-- **LagPPO vs PPO:**  
-  LagPPO usually lowers cost and violation rate compared to plain PPO, especially with moderate budgets. Returns are sometimes slightly worse but not catastrophic. When $\alpha$ or the budget are badly chosen, things can go sideways (see the tight-budget ablations).
+- `SafetyPointPush1-v0`
+- `SafetyPointButton1-v0`
+- `SafetyCarPush1-v0` (optional / secondary)
 
-- **RCPO baseline:**  
-  With a small penalty, RCPO behaves almost like PPO (unsafe). With a large penalty, it becomes very conservative and sacrifices most return. There is no obvious "right" $\beta$, and I did not do a full sweep. LagPPO's adaptive $\lambda$ feels nicer conceptually, but still requires careful tuning.
+These are good for this project because they provide:
 
-- **Shielding:**  
-  Qualitatively, the shield helps prevent "drive straight through the hazard" behavior, especially early. Quantitatively, the current intervention logging is not reliable enough to claim strong results here, so I treat this as a promising, but not fully measured, piece.
+- task reward
+- safety cost
+- hazard geometry (which also makes shielding easy to prototype)
 
-- **Preferences:**  
-  With synthetic labels and short runs, the learned reward roughly recovers the environment reward, but does not clearly improve anything. In some ablations it even hurts return a bit. For now, this module is more of a prototype for future human-feedback experiments than a useful component on its own.
+I also included optional support for **Gymnasium-Robotics FetchPush-v2**, but that environment does not provide explicit safety costs, so it is more of a future extension for manipulation experiments than a core benchmark in this draft.
 
----
+### Why I still call this "robotic manipulation"
+Even though most of the current results are from SafetyPoint / SafetyCar tasks, the framework was designed with robotic manipulation in mind:
 
-## 7. Ablation Studies
+- unified safe RL algorithms
+- reward replacement hooks
+- shield wrapper interface
+- evaluation with safety metrics
 
-The ablation driver (`src/ablations.py` + `scripts/train_all.sh`) explores:
-
-1. **Shield on/off (LagPPO):** how much the geometric shield changes early violations and final safety metrics.
-2. **Dual learning rate $\alpha$:** values in roughly $\{1\text{e}{-4}, 5\text{e}{-4}, 1\text{e}{-3}\}$, to see how quickly constraints are enforced vs how unstable training becomes.
-3. **Cost budget $d$:** tight (0.01), moderate (0.05), loose (0.1) budgets.
-4. **Preference vs environment reward:** same setup, but training on a learned reward instead of the original ones.
-5. **Algorithm comparison:** PPO, SAC, RCPO baseline, LagPPO.
-
-The script launches each training run, then calls the evaluation script, and finally merges each `metrics.csv` into a single summary CSV. Plots are generated from that summary via `src/visualize.py`.
-
-> **TODO:** The current ablation plots already show sensible qualitative trends, but they come from relatively short runs and few seeds. A more "paper-like" version would need more compute and time.
+So the current experiments are more like a safe RL benchmark layer, and later I can reuse the same structure on more realistic manipulation environments.
 
 ---
 
-## 8. Limitations and Future Work
+## 4. Evaluation and metrics
 
-Some obvious limitations of the current state:
+I did not want to evaluate only on return, because that hides the whole point of safe RL.
 
-- **Shield approximation:**  
-  The shield uses very simple 2D geometry and known hazard locations. No dynamics, no 3D, no contact modeling. It's fine for SafetyPoint-style tasks, but not a general safety mechanism.
+So the framework computes safety-aware metrics such as:
 
-- **Synthetic preferences only:**  
-  Using environment reward to generate preferences is convenient but a bit circular. Real human feedback could reveal different trade-offs (comfort, risk aversion, etc.), but that's not implemented yet.
+- **average return**
+- **average episodic cost**
+- **violation rate** (episodes with non-zero cost)
+- **per-step cost**
+- **CVaR cost** (tail-risk cost, useful for bad episodes)
+- **success rate** (when available)
+- **shield interventions** (when logging is consistent)
 
-- **Compute and tuning:**  
-  Runs are relatively short and use limited seeds. I did not do large-scale hyperparameter searches, so many "bad behaviours" might be fixable with more careful tuning that I haven't had the time/compute to do.
+A small thing I care about here: evaluation is done on the **raw environment** (not with reward shaping active), because I want to judge the learned policy behavior, not the training trick used to get it.
 
-- **Simulation only:**  
-  Everything happens in simulation. No real-robot tests, no sim-to-real study, and no hardware-specific issues.
+---
 
-Future directions I'd like to try (time and compute permitting):
+## 5. Ablation study design
 
-- More robust dual-update schemes and better heuristics for picking the budget.
-- Extending shields to 3D tasks (possibly with barrier functions or learned models).
-- Plugging in real human preferences instead of synthetic labels.
-- Running longer, multi-seed experiments to get cleaner statistics.
+I set up a systematic ablation driver with five dimensions:
+
+1. **Shield on/off**
+2. **Cost budget** (tight / medium / loose)
+3. **$\lambda$ learning rate** (dual LR)
+4. **Algorithm choice** (PPO, SAC, RCPO baseline, LagPPO)
+5. **Preference-based rewards on/off**
+
+This is maybe the part I'm happiest with in the codebase, because once the pipeline works, I can run controlled comparisons instead of changing ten things at once and guessing what happened.
+
+I also kept the scripts pretty simple (`src/ablations.py`, `scripts/train_all.sh`) so I can rerun everything later with longer horizons and more seeds.
+
+---
+
+## 6. Main observations (from current runs)
+
+This is the important part: what did I actually learn from the current experiments?
+
+### 6.1 Theoretical safe RL ideas degrade fast under short runs / limited compute
+
+This was the biggest takeaway.
+
+On paper, constrained RL gives a clean story: optimize reward under a cost budget. In practice, with function approximation + noisy rollouts + short training horizons, the behavior is much messier.
+
+The framework made this visible very clearly:
+
+- constraints are often not satisfied under tight budgets
+- dual updates can become unstable
+- safety metrics can move in the wrong direction if hyperparameters are not calibrated
+
+This is exactly why I think naive deployment on hardware is risky. If a method only looks safe in idealized training settings, that is not enough.
+
+---
+
+### 6.2 SAC was often more conservative than PPO and LagPPO in my runs
+
+One result that came out pretty consistently in my ablation summaries is that **SAC tended to achieve lower average cost and lower violation rates than PPO and LagPPO**, even when returns were not always the best.
+
+I do not read this as "SAC is universally better for safe RL."  
+I read it as:
+
+- under my current compute limits
+- with short training horizons
+- and with the current tuning
+
+SAC behaved more conservatively than the PPO-based variants.
+
+That was useful to see, because it reminded me not to assume that a constrained method (like LagPPO) will automatically dominate a strong baseline if the constrained method is under-tuned.
+
+---
+
+### 6.3 Cost budget and dual LR matter a lot (and not always in the way theory suggests)
+
+I swept cost budgets and dual learning rates, and the results made the tradeoff very obvious.
+
+A few patterns I observed:
+
+- **Very tight budgets** can make LagPPO unstable  
+  (the multiplier chases the constraint too aggressively)
+
+- **Relaxing the budget** often increased task return  
+  (less penalty pressure, easier optimization)
+
+- In my ablation summary, relaxing the budget from very tight to looser values also **reduced average episodic cost** in some runs, which is counterintuitive but real in this setup  
+  (my interpretation: the very tight setting destabilized learning so much that the agent behaved worse overall, including safety)
+
+So the "budget" is not just a high-level safety preference. It is also a training-stability knob.
+
+---
+
+### 6.4 Shielding is promising, but I need cleaner intervention logging
+
+Qualitatively, the shield helps, especially early in training. It prevents some of the dumbest hazard incursions and makes exploration less chaotic.
+
+But quantitatively, I am not fully happy with the current shield stats yet because the intervention counter can be flat in some runs when it clearly should not be.
+
+So for now my position is:
+
+- **the shield is useful**
+- **the code path works**
+- **the logging needs one more cleanup pass** before I trust the intervention plots fully
+
+---
+
+### 6.5 Preference-based rewards are a good extension point, not a strong result yet
+
+The preference module is working, but with synthetic labels and short runs it is still a toy.
+
+Sometimes it behaves fine, sometimes it hurts return a bit, and right now it does not give me a strong safety improvement.
+
+That is okay for this draft. I mainly wanted:
+
+- a reward model
+- segment pairing
+- a training loop
+- an environment wrapper for reward replacement
+
+Now that those pieces exist, I can later plug in real human preferences (or better synthetic protocols) without rewriting the project.
+
+---
+
+## 7. What this framework is useful for
+
+Even though the results are still preliminary, the framework already does something I wanted:
+
+It lets me systematically study where the clean theory of safe RL starts to break when I include:
+
+- function approximation
+- limited samples
+- short training runs
+- imperfect shielding
+- model-environment mismatch
+
+That is the real contribution of this project for me right now.
+
+It is not a polished benchmark paper yet.  
+It is a working research scaffold that exposes the safety-performance tradeoff in a way I can inspect and improve.
+
+---
+
+## 8. Limitations
+
+A few things are still clearly incomplete:
+
+- **Shield is 2D and local**  
+  Good for SafetyPoint / SafetyCar style tasks, not enough for full 3D manipulation safety.
+
+- **RCPO path is a baseline**  
+  It is currently a fixed penalty baseline, not a full adaptive RCPO implementation.
+
+- **Preference labels are synthetic**  
+  Useful for testing the pipeline, but not the same as human feedback.
+
+- **Compute limits matter**  
+  Many runs are short by design (single machine, practical time limits), so the results are more "stress test" than final benchmark.
+
+- **No real hardware yet**  
+  This is all simulation, so the final sim-to-real gap is still open.
 
 ---
 
 ## 9. Conclusion
 
-This project implements a small Safe RL stack for robotic control, combining:
+I developed an open-source framework for safe reinforcement learning in robotic control / manipulation-style environments, with:
 
-- Lagrangian PPO (LagPPO),
-- a simple geometric action shield, and
-- an optional preference-based reward model,
+- PPO, SAC, RCPO-style baseline, and Lagrangian PPO in one pipeline
+- a geometric keep-out action shield
+- a preference-based reward learning module
+- safety-aware evaluation and ablation tooling
 
-all built on top of Safety-Gymnasium and Stable-Baselines3.
+The main thing I learned is that safety methods that look clean in theory can degrade a lot in practice under realistic compute limits and short horizons. In my runs, this showed up as strong sensitivity to the cost budget and dual LR, and as baseline methods (especially SAC) sometimes looking safer than expected compared to constrained PPO variants.
 
-The main takeaway so far is that dual-based CMDP methods and simple shields can be made to work together, but they are sensitive to budgets, learning rates, and logging details. The current results are closer to a "sanity-check stage" than to a final benchmark, but the code path works end-to-end and is easy to extend.
+That is not a failure of the project. It is exactly the result I wanted to expose.
 
-My hope is that this repo can serve as a starting point, for myself and possibly others, to iterate on safer, learning-based control methods, rather than as a finished product.
+Now I have a framework where I can study these effects systematically, instead of just assuming the constraints will work because the math says they should.
 
 ---
 
-## References
+## 10. Next steps
 
-- E. Altman. *Constrained Markov Decision Processes*. Chapman & Hall/CRC, 1999.  
-- A. Ray et al. "Benchmarking Safe Exploration in Deep Reinforcement Learning." *Safe RL Workshop at NeurIPS*, 2019.  
-- C. Tessler et al. "Reward Constrained Policy Optimization." *ICLR*, 2019.  
-- P. Christiano et al. "Deep Reinforcement Learning from Human Preferences." *NeurIPS*, 2017.  
-- A. D. Ames et al. "Control Barrier Function Based Quadratic Programs for Safety Critical Systems." *IEEE Transactions on Automatic Control*, 2019.
+What I want to do next:
+
+1. Fix shield intervention logging properly
+2. Run longer ablations (more timesteps, more seeds)
+3. Tune LagPPO more carefully (budget + dual LR)
+4. Add a stronger RCPO implementation (not only fixed penalty)
+5. Replace synthetic preferences with a small real preference collection loop
+6. Push the same framework into a more realistic manipulation environment
+
+That should give me a much stronger next version (with cleaner tables/plots and less "prototype" caveats), while keeping the same overall structure.
