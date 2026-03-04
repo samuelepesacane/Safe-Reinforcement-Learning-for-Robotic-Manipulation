@@ -14,3 +14,4 @@ keywords:
   - constrained MDP
   - Lagrangian PPO
   - action shielding
+  - MuJoCo
