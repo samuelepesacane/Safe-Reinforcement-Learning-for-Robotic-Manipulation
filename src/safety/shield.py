@@ -116,13 +116,15 @@ class GenericKeepoutShield:
 
         if isinstance(obs, dict):
             if "agent_pos" in obs:
-                pos = obs["agent_pos"]
-                return np.array(pos[:2], dtype=np.float32)
+                return np.array(obs["agent_pos"][:2], dtype=np.float32)
             if "achieved_goal" in obs:
-                ag = obs["achieved_goal"]
-                return np.array(ag[:2], dtype=np.float32)
+                return np.array(obs["achieved_goal"][:2], dtype=np.float32)
 
-        # For other observation types, we do not attempt to infer the position.
+        # Flat numpy array: SafetyPointPush1-v0 puts agent XY at indices 0:2
+        if isinstance(obs, np.ndarray) and obs.shape[0] >= 2:
+            return np.array(obs[:2], dtype=np.float32)
+
+        # For other observation types, we do not attempt to infer the position
         return None
 
     def step(self, action: np.ndarray, obs: Any) -> np.ndarray:
@@ -147,6 +149,8 @@ class GenericKeepoutShield:
             returned.
         :rtype: numpy.ndarray
         """
+
+        # print(f"[Shield.step] hazards={self.hazards}, obs_type={type(obs)}, obs_shape={getattr(obs, 'shape', 'N/A')}")
         self.last_intervened = False
 
         # No hazards configured --> nothing to do
@@ -198,6 +202,7 @@ class GenericKeepoutShield:
             a_proj[:2] = a_xy * scale
             self.last_intervened = True
             self.interventions_in_episode += 1
+            # print(f"[Shield] INTERVENED: scale={scale:.3f}, pos={pos}, hazard approach detected")
             return a_proj
 
         return action

@@ -158,24 +158,43 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
         return lambda env: MujocoShield()
 
     def factory(env: Any) -> GenericKeepoutShield:
-        # Initialize with empty hazards; we may fill them via env introspection.
+        # Initialize with empty hazards
+        # we may fill them via env introspection
         shield = GenericKeepoutShield(
             hazards=[],
             dt=0.1,
             max_action_norm=float(np.max(env.action_space.high)),
         )
-        # Best-effort attempt to read hazard positions from Safety-Gymnasium internals.
+        # attempt to read hazard positions from Safety-Gymnasium internals
         try:
             uw = env.unwrapped
-            if hasattr(uw, "world") and hasattr(uw.world, "hazards_pos"):
-                positions = uw.world.hazards_pos  # list of 2D centers
-                radius = getattr(uw.world, "hazards_size", 0.5)
-                hz = [(float(x), float(y), float(radius)) for (x, y) in positions]
+
+            hazards_pos = None
+            hazards_size = 0.2  # Safety-Gymnasium default radius for point tasks
+
+            if hasattr(uw, "task") and hasattr(uw.task, "hazards"):
+                h = uw.task.hazards
+                hazards_pos = getattr(h, "pos", None)
+                hazards_size = float(getattr(h, "size", 0.2))
+            elif hasattr(uw, "task") and hasattr(uw.task, "hazards_pos"):
+                # Older Safety-Gymnasium layout where pos is directly on task
+                hazards_pos = uw.task.hazards_pos
+                hazards_size = float(getattr(uw.task, "hazards_size", 0.2))
+            elif hasattr(uw, "world") and hasattr(uw.world, "hazards_pos"):
+                # Legacy Safety-Gym (pre-0.4) attribute path
+                hazards_pos = uw.world.hazards_pos
+                hazards_size = float(getattr(uw.world, "hazards_size", 0.2))
+
+            if hazards_pos is not None and len(hazards_pos) > 0:
+                # pos entries are 3D arrays (x, y, z); we only need x, y for the 2D shield
+                hz = [(float(p[0]), float(p[1]), hazards_size) for p in hazards_pos]
                 shield.set_hazards(hz)
-        except Exception:
-            # If the environment structure changes, we simply fall back to an
-            # empty shield rather than failing hard.
-            pass
+                print(f"[Shield] loaded {len(hz)} hazards: {hz}")
+            else:
+                print("[Shield] WARNING: could not find hazard positions, shield is pass-through")
+
+        except Exception as e:
+            print(f"[Shield] WARNING: hazard introspection failed: {e}")
 
         return shield
 
