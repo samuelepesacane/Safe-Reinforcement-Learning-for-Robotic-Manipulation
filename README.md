@@ -27,7 +27,7 @@ A few quick takeaways:
 
 - **Very tight budgets can make things worse.**  
   With a budget like '0.01', both cost and CVaR blow up. 
-  The dual step is too aggressive relative to the target, so λ chases the constraint and destabilizes training instead of enforcing it.
+  The dual step is too aggressive relative to the target, so $\lambda$ chases the constraint and destabilizes training instead of enforcing it.
 
 - **Loose budgets buy return by spending safety.**  
   Relaxed budgets ('0.1') give better returns but keep costs high. 
@@ -88,7 +88,7 @@ This is the rough structure of the code:
 - `scripts/train_all.sh`: runs the ablations and plots summary figures under `results/`
 
 If you're trying to hack on something:
-- **LagPPO / λ updates** start from `src/algos/lagppo.py`
+- **LagPPO / $\lambda$ updates** start from `src/algos/lagppo.py`
 - **Shield** `src/safety/shield.py` and `src/envs/make_env.py`
 - **Preferences** `src/reward/preferences/`
 
@@ -133,6 +133,249 @@ Unlike Safety-Gymnasium, **Gymnasium-Robotics environments do not include explic
 > **Note:**
 > FetchPush-v2 support is **optional** and has **not been fully tested** in this repository yet.
 > A configuration file is provided at `configs/fetch_push.yaml`.
+
+---
+
+## Direct MuJoCo XML Integration
+
+This section talks about a direct use of MuJoCo. You don't need this for Safe RL. 
+This is a section if you want to go over Safety-Gymnasium and use your personal robot.
+If you want you can skip this section and go directly to [Quickstart](#Quickstart).  
+
+---
+
+Up to this point, every environment in this repo goes through **Safety-Gymnasium**.
+
+That is the right choice for studying safe RL algorithms: Safety-Gymnasium gives you reward,
+cost, hazard geometry, and a well-defined constraint budget out of the box.
+You don't have to think about any of that, you just call `gym.make("SafetyPointPush1-v0")`
+and get a fully wired environment.
+
+But there is a cost to that convenience.
+You are always working with someone else's robot, someone else's reward function,
+and someone else's definition of what "safe" means.
+
+If you want to ask:
+- *What if I have a different robot model?*
+- *What if I want to define my own hazard zones from scratch?*
+- *What if I want to test the pipeline on a model I designed or received from somewhere?*
+
+then you need to go one level below Safety-Gymnasium and talk to **MuJoCo directly**.
+
+That is what `mujoco_connector.py` does.
+
+---
+
+### What MuJoCo actually is (and what Safety-Gymnasium hides from you)
+
+MuJoCo is a physics engine.
+You describe a robot and a world in an XML file, and MuJoCo simulates the physics:
+joint positions, velocities, contact forces, everything.
+
+When you call `gym.make("SafetyPointPush1-v0")`, Safety-Gymnasium:
+1. loads a MuJoCo `.xml` model internally (you never see it)
+2. builds observations by flattening joint states for you
+3. applies a reward function it already wrote
+4. applies a cost function it already wrote (hazard violations, etc.)
+5. wraps all of that in a standard Gymnasium interface
+
+So the Gymnasium interface you interact with in this codebase is already several layers above raw MuJoCo.
+
+The connector cuts those layers out.
+It loads any `.xml` file you give it, talks to `mujoco.MjModel` and `mujoco.MjData` directly,
+and builds a Gymnasium environment from scratch that the rest of this pipeline can use without modification.
+
+---
+
+### What the connector does
+
+`mujoco_connector.py` defines one main class: `MujocoRoboticEnv`.
+
+It is a standard `gymnasium.Env` that:
+
+- loads any MuJoCo `.xml` model by path
+- builds the **observation** as: joint positions ∥ joint velocities ∥ end-effector position ∥ goal position
+- builds the **action** as: normalized torques in `[-1, 1]`, then rescaled to each actuator's physical range (`ctrlrange` from the XML)
+- computes **reward** as: negative distance from end-effector to goal, plus a success bonus when the goal is reached
+- computes **cost** as: penetration depth into user-defined hazard geometries, clipped to `[0, 1]`
+- returns an **info dict** with exactly the keys the rest of the pipeline expects:
+  `cost`, `is_success`, `shield_intervened`
+
+That last point is important.
+`CostInfoWrapper`, `LagrangianCallback`, `ShieldingActionWrapper`, `evaluate.py`, `metrics.py` 
+none of these know or care whether the environment came from Safety-Gymnasium or from a raw XML file.
+They just see a Gymnasium env that produces observations, rewards, costs, and info dicts in the right format.
+The connector produces exactly that.
+
+---
+
+### How the integration works
+
+The natural place to add a new environment type in this codebase is `src/envs/make_env.py`.
+
+Looking at the actual code, `make_env()` is mostly a wrapper assembler.
+The real environment creation happens inside `_try_make()`, which calls `gym.make(env_id)`.
+
+The patch is small. Five new lines go at the top of `_try_make()`, before the original `gym.make()` call:
+
+```python
+def _try_make(env_id: str, seed: int) -> gym.Env:
+    if env_id.startswith("mujoco:"):
+        model_path = env_id[len("mujoco:"):]
+        env = MujocoRoboticEnv(model_path=model_path)
+        env.reset(seed=seed)
+        return env
+    # ... original gym.make() path, completely unchanged below
+```
+
+If the `env_id` starts with `mujoco:`, we load the XML directly and return early.
+If not, we fall through to the original path.
+
+The second edit is three lines in `build_shield_factory()` inside `src/train.py`.
+That function normally reads `env.unwrapped.world.hazards_pos`, a Safety-Gymnasium internal attribute
+that does not exist on a raw MuJoCo env. The guard skips that and returns a pass-through shield instead:
+
+```python
+def build_shield_factory(env_id: str):
+    if env_id.startswith("mujoco:"):
+        from mujoco_connector import MujocoShield
+        return lambda env: MujocoShield()
+    # ... original factory code, unchanged
+```
+
+That is the complete integration. Two files edited, five lines each.
+Every algorithm, every wrapper, every evaluation script above that level is untouched.
+
+---
+
+### The test model: `assets/robot.xml`
+
+A minimal 3-DOF robot arm is included at `assets/robot.xml`.
+
+It has:
+- three hinge joints (shoulder rotation, elbow, wrist)
+- a named `end_effector` site (what the connector tracks as the tip of the arm)
+- a named `target` site (the goal the arm has to reach)
+- a `hazard1` sphere geom (the unsafe zone that produces a cost signal)
+
+This model is intentionally simple.
+The goal is not to benchmark a production robot but to verify that the full pipeline,
+training, evaluation, logging, Lagrangian constraint tracking, runs end-to-end on a model you control.
+
+The site names (`end_effector`, `target`) are the connector's defaults.
+If you use a different model, you can override them in `MujocoRoboticEnv.__init__`.
+If a site is not found, the corresponding component of reward or observation returns zero
+(the simulation still runs, it just has no spatial objective).
+
+---
+
+### Running it
+
+```bash
+export MUJOCO_GL=egl   # required on WSL2, avoids display errors
+
+python -m src.train \
+  --env_id mujoco:assets/robot.xml \
+  --algo lagppo \
+  --total_timesteps 50000 \
+  --seed 0 \
+  --num_envs 1 \
+  --cost_budget 0.05 \
+  --lr_lambda 5e-4 \
+  --eval_freq 5000 \
+  --log_dir logs/mujoco_lagppo
+```
+
+Evaluate the trained checkpoint:
+
+```bash
+python -m src.evaluate \
+  --env_id "mujoco:assets/robot.xml" \
+  --model_path "checkpoints/mujoco:assets/robot.xml/lagppo/seed_0/latest" \
+  --episodes 10 --seed 100 \
+  --log_dir results/eval_mujoco
+```
+
+---
+
+### What the results actually show (and what they mean)
+
+Running LagPPO for 50k steps on the included arm model:
+
+| metric                               | value |
+|--------------------------------------|---|
+| policy std (start $\to$ end)         | 1.0 $\to$ 0.68 |
+| value loss (start $\to$ end)         | 2.96 $\to$ 0.34 |
+| explained variance (start $\to$ end) | −0.24 $\to$ +0.21 |
+| evaluation success rate              | 1.0 |
+| average cost                         | 0.0 |
+| Lagrange multiplier $\lambda$        | 0.0 (flat) |
+
+The policy clearly learns: the std shrinks (the agent becomes more decisive),
+the value loss drops (the critic learns to predict returns),
+and the explained variance goes from negative to positive
+(which means the critic's predictions are becoming meaningful).
+
+The cost and lambda being flat at zero deserves a short explanation,
+because at first glance it might look like something is broken.
+
+It is not.
+
+The hazard geom (`hazard1`) is placed at a position the arm does not need to pass through
+to reach the target. The policy learns a path that reaches the goal without entering the hazard zone.
+When no constraint is ever violated, the Lagrangian has nothing to react to, so $\lambda$ stays at zero.
+That is correct behaviour.
+
+There is a useful concept here worth naming: a constraint that is never violated is called
+**vacuously satisfied**. It does not mean the safety mechanism is not working,
+it means the task geometry made the constraint inactive.
+If you move `hazard1` into the arm's natural reaching path in the XML,
+the cost signal becomes non-zero and the Lagrangian mechanism will activate.
+The cost curve will no longer be flat.
+
+---
+
+### Limitations
+
+**`--num_envs 1` is required.**  
+`MujocoRoboticEnv` cannot be pickled across subprocesses, so `SubprocVecEnv`
+(which this codebase uses when `num_envs > 1`) will crash.
+This makes training slower than the Safety-Gymnasium runs.
+
+**The shield is a pass-through.**  
+`MujocoShield` satisfies the `ShieldingActionWrapper` interface but does not do
+any geometry-based action projection. The existing 2D geometric shield in `src/safety/shield.py`
+is designed for point robots in a flat plane, it is not directly applicable to a 3D arm.
+Extending it to 3D manipulation is a non-trivial research problem in its own right.
+
+**Tested on MuJoCo 2.3.0.**  
+The `mujoco.viewer` module (used for live rendering) was added in 2.3.7.
+On 2.3.0, rendering is skipped silently. Everything else works.
+
+**Site names must match the XML.**  
+If your model does not have sites named `end_effector` and `target`,
+the distance-based reward returns zero. The simulation runs normally,
+it just has no spatial objective until you configure the right site names.
+
+---
+
+### What this is actually for
+
+This connector is not trying to replace Safety-Gymnasium for safe RL benchmarking.
+Safety-Gymnasium is the right tool for that and this repo uses it for everything else.
+
+What the connector demonstrates is that the pipeline is not locked to one simulator.
+
+The same Lagrangian PPO, the same cost tracking, the same evaluation metrics,
+the same Lagrange multiplier update, all of it runs on a model you define from scratch in XML.
+The algorithms do not know what kind of environment they are training in.
+They just see a Gymnasium interface.
+
+That is the useful property for research:
+if you want to study safe RL on a new robot geometry,
+you write the XML, point `--env_id` at it, and everything else stays the same.
+
+---
 
 ## Quickstart
 1) **Create an environment and install dependencies**
@@ -366,7 +609,7 @@ This repo is still very much a work in progress. Roughly in order of pain points
 
 - **Training / tooling quality of life**
   - Add checkpointing + resume (including Lagrange multiplier state).
-  - Improve logging: make it easier to see rewards, costs, λ, and shield interventions in one place.
+  - Improve logging: make it easier to see rewards, costs, $\lambda$, and shield interventions in one place.
   - Add a few more unit tests (Lagrangian update, shield projection, preference loss) and maybe a tiny Continuous Integration (CI) job.
 
 ### Longer-term ideas (if/when compute allows)
@@ -392,10 +635,10 @@ This is not implemented yet. At the moment, consider it a "future experiment" ra
 If some of the terms above are unfamiliar (CMDP, RCPO, CVaR, preference learning), a few classic references:
 
 - Altman, *Constrained Markov Decision Processes*, 1999 - CMDP basics
-- Tessler et al., "Reward Constrained Policy Optimization", ICLR 2019 - RCPO-style methods
-- Ray et al., "Benchmarking Safe Exploration in Deep RL", NeurIPS 2019 - Safety Gym
-- Christiano et al., "Deep RL from Human Preferences", NeurIPS 2017 - preference-based reward learning
-- Ames et al., "Control Barrier Function Based Quadratic Programs for Safety Critical Systems", TAC 2019 - safety via barrier functions
+- Tessler et al., *Reward Constrained Policy Optimization*, ICLR 2019 - RCPO-style methods
+- Ray et al., *Benchmarking Safe Exploration in Deep RL*, NeurIPS 2019 - Safety Gym
+- Christiano et al., *Deep RL from Human Preferences*, NeurIPS 2017 - preference-based reward learning
+- Ames et al., *Control Barrier Function Based Quadratic Programs for Safety Critical Systems*, TAC 2019 - safety via barrier functions
 
 The repo is not trying to reproduce their results, but it borrows a lot of ideas from that literature.
 

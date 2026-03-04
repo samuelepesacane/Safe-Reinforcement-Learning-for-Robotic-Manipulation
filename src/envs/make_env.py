@@ -2,6 +2,7 @@ from typing import Callable, Optional, Any, Dict, Tuple
 import gymnasium as gym
 import numpy as np
 from gymnasium.wrappers.time_limit import TimeLimit
+from mujoco_connector import MujocoRoboticEnv
 
 # Try to import Safety-Gymnasium so that env IDs like "SafetyPointPush1-v0" work
 # If it's not installed, gymnasium will raise an error when such envs are created
@@ -354,6 +355,12 @@ def _try_make(env_id: str, seed: int) -> gym.Env:
     is applied *inside* the TimeLimit so that episode truncation semantics
     are preserved.
     """
+    if env_id.startswith("mujoco:"):
+        model_path = env_id[len("mujoco:"):]
+        env = MujocoRoboticEnv(model_path=model_path)
+        env.reset(seed=seed)
+        return env
+
     env = gym.make(env_id, disable_env_checker=True)
 
     if isinstance(env, TimeLimit):
@@ -361,7 +368,7 @@ def _try_make(env_id: str, seed: int) -> gym.Env:
         tl = env
         base = tl.env  # unwrap
         base = NormalizeStepReturn(base)
-		# Recreate TimeLimit preserving its max steps
+        # Recreate TimeLimit preserving its max steps
         max_steps = getattr(tl, "max_episode_steps", getattr(tl, "_max_episode_steps", None))
         env = TimeLimit(base, max_episode_steps=max_steps) if max_steps is not None else TimeLimit(base)
     # If there is no TimeLimit, we could still wrap with NormalizeStepReturn,

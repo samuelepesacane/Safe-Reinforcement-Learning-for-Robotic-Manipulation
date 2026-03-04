@@ -17,6 +17,7 @@ runs/
 videos/
 results/
 checkpoints/
+MUJOCO_LOG.TXT
 
 # IDE
 .vscode/

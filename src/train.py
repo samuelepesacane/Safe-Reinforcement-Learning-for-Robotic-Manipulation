@@ -153,6 +153,10 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
     :rtype: Callable[[Any], GenericKeepoutShield]
     """
 
+    if env_id.startswith("mujoco:"):
+        from mujoco_connector import MujocoShield
+        return lambda env: MujocoShield()
+
     def factory(env: Any) -> GenericKeepoutShield:
         # Initialize with empty hazards; we may fill them via env introspection.
         shield = GenericKeepoutShield(
