@@ -24,13 +24,15 @@ METRIC_LABELS = {
     "eval/avg_interventions":       "Avg. Shield Interventions",
 }
 
-# Candidate metrics to look for in logged data
+
 CANDIDATE_METRICS = [
     "train/ep_return",
     "train/ep_cost",
     "train/lambda",
     "train/avg_cost_per_step",
-    "train/violation_rate",
+    "train/violation_rate",  # Numerically identical to train/avg_cost_per_step in environments 
+    # with binary cost signals (e.g. SafetyPointPush1-v0), where every nonzero cost step satisfies c > cost_budget
+    # Meaningful in environments with graded cost signals
     "train/shield_intervention_rate",
     "eval/avg_return",
     "eval/avg_cost",
