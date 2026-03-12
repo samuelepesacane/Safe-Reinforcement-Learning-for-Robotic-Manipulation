@@ -1,25 +1,25 @@
 """
 Unit tests for the GenericKeepoutShield geometric safety filter.
 
-The goal is to ensure that:
-- when the agent's proposed action would move it inside a hazard disc,
-  the shield projects the action so that the predicted next position stays
-  (slightly) outside the hazard.
+Verifies that when a proposed action would move the agent inside a hazard disc,
+the shield projects the action so the predicted next position stays just outside.
 """
-
 import unittest
 import numpy as np
 from src.safety.shield import GenericKeepoutShield
 
 
 class TestGenericKeepoutShield(unittest.TestCase):
-    """Tests for the 2D geometric keep-out shield."""
+    """Tests for the 2D geometric keepout shield."""
 
     def test_projection_avoids_hazard(self) -> None:
         """
-        If the raw action would move the agent into the hazard,
-        the shield should scale the action so the next position remains
-        just outside the hazard radius.
+        The shielded action should keep the next position outside the hazard.
+
+        The agent starts inside the hazard radius and proposes an action that
+        would move it further toward the hazard center. The shield must scale
+        the action so the predicted next position satisfies
+        dist(next_pos, center) >= radius - epsilon.
         """
         # Single hazard centered at the origin with radius 1.0
         shield = GenericKeepoutShield(
@@ -28,22 +28,17 @@ class TestGenericKeepoutShield(unittest.TestCase):
             max_action_norm=1.0,
         )
 
-        # Agent starts at x=0.5, moving left with velocity -1.0
-        # Without shielding, it would cross the hazard center at (0, 0)
+        # Agent at (0.5, 0) moving left: without shielding it crosses the center
         obs = {"agent_pos": np.array([0.5, 0.0], dtype=np.float32)}
         action = np.array([-1.0, 0.0], dtype=np.float32)
 
         safe_action = shield.step(action, obs)
 
-        # Predicted next position under the shielded action
         next_pos = obs["agent_pos"][:2] + shield.dt * safe_action[:2]
+        dist = np.linalg.norm(next_pos - np.array([0.0, 0.0], dtype=np.float32))
 
-        # Distance to hazard center must be >= radius - epsilon
-        center = np.array([0.0, 0.0], dtype=np.float32)
-        dist = np.linalg.norm(next_pos - center)
-
+        # Next position must be at least (radius - epsilon) from the hazard center
         self.assertGreaterEqual(dist, 1.0 - 1e-3)
-        # Check that the shield actually intervened
         self.assertTrue(shield.last_intervened)
 
 

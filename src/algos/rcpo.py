@@ -1,27 +1,31 @@
+"""
+Factory for the RCPO fixed-penalty baseline.
+
+Not used in the current training pipeline. Planned for a future extension
+that will compare against a faithful implementation of Tessler et al. (2018).
+"""
+
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from stable_baselines3 import PPO
 
 
-# This file is still incomplete. I am planning to finish it in the next version.
-
 @dataclass
 class RCPOConfig:
     """
-    Configuration for an RCPO-style fixed-penalty baseline.
+    Configuration for the RCPO fixed-penalty baseline.
 
     In this project, "RCPO" refers to a PPO agent trained on a
     penalty-shaped reward of the form:
 
         r' = r - penalty_coef * cost
 
-    where ``cost`` is a scalar safety signal provided by the environment.
-    The actual shaping is implemented outside the model (e.g. in a reward
-    wrapper); this dataclass simply stores the penalty coefficient used
-    by that wrapper.
+    where cost is a scalar safety signal provided by the environment.
+    The shaping itself is applied by the reward wrapper in src/envs;
+    this dataclass only stores the coefficient used by that wrapper.
 
     :param penalty_coef: Fixed penalty coefficient multiplying the safety cost.
-    :type penalty_coef: float
+        :type penalty_coef: float
     """
     penalty_coef: float = 10.0
 
@@ -34,32 +38,27 @@ def make_rcpo(
     config: Optional[Dict[str, Any]] = None,
 ) -> PPO:
     """
-    Create a PPO model to be used in an RCPO-style constrained RL setup.
+    Create a PPO model configured for RCPO-style constrained RL training.
 
-    The PPO hyperparameters used here mirror those in ``make_ppo`` so that
-    comparisons between PPO and RCPO are controlled. The difference between
-    PPO and RCPO in this repository lies in the *reward signal* used during
-    training: for RCPO, the environment's reward is externally reshaped as
+    The PPO hyperparameters mirror those in make_ppo so that comparisons
+    between plain PPO and RCPO are controlled. The only difference between
+    the two in this codebase is the reward signal: for RCPO, the environment
+    reward is externally reshaped as r' = r - penalty_coef * cost using a
+    fixed coefficient (see RCPOConfig and the reward wrappers in src/envs).
 
-        r' = r - penalty_coef * cost
-
-    using a fixed penalty coefficient (see RCPOConfig and the
-    reward shaping wrappers in src/envs).
-
-    :param policy: Policy class or string identifier for SB3's PPO (e.g. "MlpPolicy").
-    :type policy: str
+    :param policy: Policy class name accepted by SB3's PPO (e.g. "MlpPolicy").
+        :type policy: str
     :param env: Environment instance or VecEnv compatible with SB3.
-    :type env: Any
+        :type env: Any
     :param tensorboard_log: Optional path for TensorBoard logs.
-    :type tensorboard_log: Optional[str]
+        :type tensorboard_log: Optional[str]
     :param seed: Random seed for the PPO model.
-    :type seed: int
-    :param config: Optional dictionary of PPO hyperparameters. Any keys provided
-        here override the defaults specified in this function.
-    :type config: Optional[Dict[str, Any]]
+        :type seed: int
+    :param config: Optional PPO hyperparameters that override the defaults.
+        :type config: Optional[Dict[str, Any]]
 
     :return: Instantiated PPO model configured for RCPO-style training.
-    :rtype: stable_baselines3.PPO
+        :rtype: PPO
     """
     cfg: Dict[str, Any] = dict(
         n_steps=2048,
@@ -78,5 +77,4 @@ def make_rcpo(
     if config is not None:
         cfg.update(config)
 
-    model: PPO = PPO(policy, env, **cfg)
-    return model
+    return PPO(policy, env, **cfg)

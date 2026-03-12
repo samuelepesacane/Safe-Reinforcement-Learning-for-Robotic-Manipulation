@@ -1,12 +1,9 @@
 """
 Unit tests for the LagrangianState dual update.
 
-These tests verify that:
-- the Lagrange multiplier lambda increases when the average cost exceeds
-  the target budget, and
-- lambda is never driven below zero (projection onto [0, +inf)).
+Verifies that the Lagrange multiplier increases when the average cost exceeds
+the target budget, and that it is never driven below zero.
 """
-
 import unittest
 from src.algos.lagppo import LagrangianState
 
@@ -16,9 +13,10 @@ class TestLagrangianStateUpdate(unittest.TestCase):
 
     def test_lambda_increases_when_cost_above_budget(self) -> None:
         """
-        If the observed average cost is above the budget, lambda should increase.
+        Lambda should increase when the observed cost is above the budget.
 
-        This corresponds to tightening the constraint in a CMDP dual update.
+        This corresponds to tightening the constraint penalty in the CMDP
+        dual update, pushing the policy toward safer behavior.
         """
         st = LagrangianState(lam=0.0, lr_lambda=1e-3, cost_budget=0.05)
         lam1 = st.update(avg_cost_per_step=0.10)
@@ -26,10 +24,10 @@ class TestLagrangianStateUpdate(unittest.TestCase):
 
     def test_lambda_clamped_at_zero(self) -> None:
         """
-        If the update would push lambda below zero, it should be clamped at 0.
+        Lambda should be clamped at zero when the update would push it negative.
 
-        This ensures the Lagrange multiplier remains in the feasible region
-        lambda greater or equal than 0.
+        The Lagrange multiplier must remain in the feasible region lambda >= 0;
+        a negative multiplier would invert the safety penalty into a safety bonus.
         """
         st = LagrangianState(lam=0.1, lr_lambda=1e-1, cost_budget=0.10)
         lam1 = st.update(avg_cost_per_step=0.0)

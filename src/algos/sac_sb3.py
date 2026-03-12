@@ -10,27 +10,24 @@ def make_sac(
     config: Optional[Dict[str, Any]] = None,
 ) -> SAC:
     """
-    Create a Stable-Baselines3 SAC model with defaults tailored to
-    continuous-control tasks.
+    Create a SAC model with defaults tailored to continuous-control tasks.
 
-    The configuration is intended to serve as a strong off-policy baseline.
-    Hyperparameters can be overridden via `config`.
+    Used as the off-policy baseline in the ablation study. Hyperparameters
+    can be overridden via the config dictionary.
 
-    :param policy: Policy class name or identifier accepted by SB3's SAC
-        (e.g. "MlpPolicy").
-    :type policy: str
+    :param policy: Policy class name accepted by SB3's SAC (e.g. "MlpPolicy").
+        :type policy: str
     :param env: Environment instance or VecEnv compatible with SB3.
-    :type env: Any
+        :type env: Any
     :param tensorboard_log: Optional path for TensorBoard logs.
-    :type tensorboard_log: Optional[str]
+        :type tensorboard_log: Optional[str]
     :param seed: Random seed for the SAC model.
-    :type seed: int
-    :param config: Optional dictionary of SAC hyperparameters that overrides
-        the defaults defined in this function.
-    :type config: Optional[Dict[str, Any]]
+        :type seed: int
+    :param config: Optional SAC hyperparameters that override the defaults.
+        :type config: Optional[Dict[str, Any]]
 
     :return: Instantiated SAC model ready for training.
-    :rtype: stable_baselines3.SAC
+        :rtype: SAC
     """
     cfg: Dict[str, Any] = dict(
         buffer_size=1_000_000,
@@ -48,5 +45,4 @@ def make_sac(
     if config is not None:
         cfg.update(config)
 
-    model: SAC = SAC(policy, env, **cfg)
-    return model
+    return SAC(policy, env, **cfg)

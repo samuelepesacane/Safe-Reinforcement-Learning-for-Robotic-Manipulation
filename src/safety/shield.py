@@ -1,32 +1,31 @@
-from typing import List, Tuple, Optional, Any
+from typing import List, Optional, Tuple, Any
 import numpy as np
+
 
 class GenericKeepoutShield:
     """
     Conservative geometric keepout shield for 2D robots (e.g. SafetyPoint, SafetyCar).
 
-    The shield maintains a list of circular hazard regions and modifies the agent's
-    proposed action when the predicted next position would enter any hazard disc.
+    The shield maintains a list of circular hazard regions and modifies the
+    agent's proposed action when the predicted next position would enter any
+    hazard disc. It operates entirely at execution time and requires no
+    training: the only inputs are hazard positions and radii, which are read
+    from the environment at the start of each episode.
 
     High-level behavior:
-    - Extract the agent's current XY position from the observation (when available).
+    - Extract the agent's current XY position from the observation.
     - Interpret the first two components of the action as an XY velocity command.
     - Predict the next position: pos_next = pos + dt * a_xy.
-    - If pos_next lies inside a hazard disc, scale the action magnitude down along
-      its direction so that the next position stays just outside the hazard.
+    - If pos_next lies inside a hazard disc, scale the action magnitude down
+      along its current direction until the next position stays just outside
+      the hazard boundary.
     - Otherwise, return the original action unchanged.
 
-    Notes:
-    - This is a purely geometric shield, not a full dynamics model. It improves
-      safety locally but does not provide formal guarantees in all scenarios.
-    - If the agent's position cannot be inferred from the observation, the shield
-      acts as a pass-through (no intervention).
-    - For 3D tasks such as Fetch manipulation, this 2D shield is not directly
-      applicable and will again degenerate to a pass-through.
-
-    Usage example::
-        shield = GenericKeepoutShield(hazards=[(0.0, 0.0, 0.5)], dt=0.1, max_action_norm=1.0)
-        safe_action = shield.step(action, obs)
+    This is a purely geometric shield. It improves safety locally but does not
+    provide formal guarantees in all scenarios. If the agent's position cannot
+    be inferred from the observation, the shield acts as a pass-through.
+    For 3D tasks such as Fetch manipulation, it also degenerates to a
+    pass-through since the 2D projection is not meaningful.
     """
 
     def __init__(
@@ -40,28 +39,27 @@ class GenericKeepoutShield:
         Initialize the keepout shield.
 
         :param hazards: List of hazard discs, each as (x, y, radius). If None,
-            the shield starts with no hazards and will act as a pass-through.
-        :type hazards: Optional[List[Tuple[float, float, float]]]
-        :param dt: Effective time step used to predict the next position
+            the shield starts with no hazards and acts as a pass-through.
+            :type hazards: Optional[List[Tuple[float, float, float]]]
+        :param dt: Time step used to predict the next position
             (pos_next = pos + dt * a_xy).
-        :type dt: float
-        :param max_action_norm: Maximum allowed L2 norm of the XY action component.
-            Actions exceeding this norm are rescaled before safety checks.
-        :type max_action_norm: float
-        :param epsilon: Small margin used when computing the safe boundary around
-            hazards; the shield keeps the predicted position at least `epsilon`
-            outside the hazard radius.
-        :type epsilon: float
+            :type dt: float
+        :param max_action_norm: Maximum allowed L2 norm of the XY action
+            component. Actions exceeding this are rescaled before safety checks.
+            :type max_action_norm: float
+        :param epsilon: Safety margin kept between the predicted position and
+            the hazard boundary.
+            :type epsilon: float
 
-        :return: None
-        :rtype: None
+        :return: None.
+            :rtype: None
         """
         self.hazards: List[Tuple[float, float, float]] = hazards if hazards is not None else []
         self.dt: float = dt
         self.max_action_norm: float = max_action_norm
         self.epsilon: float = epsilon
 
-        # Diagnostics
+        # Diagnostics: readable by the environment wrapper to log intervention stats
         self.last_intervened: bool = False
         self.interventions_in_episode: int = 0
 
@@ -69,11 +67,14 @@ class GenericKeepoutShield:
         """
         Update the list of hazard discs.
 
-        :param hazards: New list of hazard discs, each as (x, y, radius).
-        :type hazards: List[Tuple[float, float, float]]
+        Called at the start of each episode so the shield always has the
+        current hazard layout, which may change between episodes.
 
-        :return: None
-        :rtype: None
+        :param hazards: New list of hazard discs, each as (x, y, radius).
+            :type hazards: List[Tuple[float, float, float]]
+
+        :return: None.
+            :rtype: None
         """
         self.hazards = hazards
 
@@ -81,12 +82,11 @@ class GenericKeepoutShield:
         """
         Reset episode-level intervention counters.
 
-        This should be called at the beginning of each new episode.
-        It clears both the last_intervened flag and the per-episode
-        intervention count.
+        Should be called at the start of each new episode to clear
+        per-episode statistics before the next rollout.
 
-        :return: None
-        :rtype: None
+        :return: None.
+            :rtype: None
         """
         self.interventions_in_episode = 0
         self.last_intervened = False
@@ -95,21 +95,19 @@ class GenericKeepoutShield:
         """
         Extract the agent's 2D position from an observation.
 
-        The method supports common observation structures used in
-        Safety-Gymnasium and robotics tasks:
+        Supports the observation layouts used in Safety-Gymnasium and
+        Gymnasium-Robotics: dict observations with "agent_pos" or
+        "achieved_goal", and flat numpy arrays where XY are at indices 0:2
+        (the layout used by SafetyPointPush1-v0).
 
-        - dict observations with key "agent_pos"
-        - dict observations with key "achieved_goal"
-
-        If no suitable key is found, the function returns None and the
-        shield will act as a pass-through.
+        Returns None if the position cannot be reliably extracted, which
+        causes the shield to act as a pass-through for that step.
 
         :param obs: Environment observation at the current time step.
-        :type obs: Any
+            :type obs: Any
 
-        :return: 2D position of the agent as a NumPy array [x, y], or None if
-            the position cannot be reliably extracted.
-        :rtype: Optional[np.ndarray]
+        :return: 2D position [x, y], or None if extraction fails.
+            :rtype: Optional[np.ndarray]
         """
         if obs is None:
             return None
@@ -120,73 +118,66 @@ class GenericKeepoutShield:
             if "achieved_goal" in obs:
                 return np.array(obs["achieved_goal"][:2], dtype=np.float32)
 
-        # Flat numpy array: SafetyPointPush1-v0 puts agent XY at indices 0:2
+        # Flat array: SafetyPointPush1-v0 puts agent XY at indices 0:2
         if isinstance(obs, np.ndarray) and obs.shape[0] >= 2:
             return np.array(obs[:2], dtype=np.float32)
 
-        # For other observation types, we do not attempt to infer the position
         return None
 
     def step(self, action: np.ndarray, obs: Any) -> np.ndarray:
         """
         Project a proposed action through the geometric keepout shield.
 
-        If the predicted next position (based on the current observation and
-        proposed action) would violate a hazard constraint, the action is
-        rescaled along its direction so that the next position remains just
-        outside the hazard. Otherwise, the original action is returned.
+        If the predicted next position would violate a hazard constraint,
+        the action is rescaled along its current direction using bisection
+        so the next position stays just outside the hazard boundary.
+        If multiple hazards are violated, the most conservative scale is used.
 
         :param action: Proposed action from the policy. The first two entries
             are interpreted as XY velocity components.
-        :type action: numpy.ndarray
-        :param obs: Current environment observation, used to extract the agent's
-            XY position. If the position cannot be extracted, the action is
-            returned unchanged.
-        :type obs: Any
+            :type action: np.ndarray
+        :param obs: Current environment observation, used to extract the
+            agent's XY position. If the position cannot be extracted, the
+            action is returned unchanged.
+            :type obs: Any
 
-        :return: Safe action after optional projection. If an intervention occurs,
-            the XY components are scaled; otherwise, the original action is
-            returned.
-        :rtype: numpy.ndarray
+        :return: Safe action after optional scaling. Returns the original
+            action if no intervention is needed or if position is unavailable.
+            :rtype: np.ndarray
         """
-
-        # print(f"[Shield.step] hazards={self.hazards}, obs_type={type(obs)}, obs_shape={getattr(obs, 'shape', 'N/A')}")
         self.last_intervened = False
 
-        # No hazards configured --> nothing to do
+        # No hazards configured: nothing to check
         if not self.hazards:
             return action
 
         pos = self._extract_agent_xy(obs)
         if pos is None:
-            # Position not available --> pass-through for safety
             return action
 
         a = np.array(action, dtype=np.float32)
         if a.shape[0] < 2:
-            # Action is not 2D --> leave it unchanged
             return action
 
         a_xy = a[:2]
 
-        # Clip the action norm to max_action_norm
+        # Clip to max_action_norm before predicting the next position
         norm = np.linalg.norm(a_xy)
         if norm > self.max_action_norm:
             a_xy = a_xy / (norm + 1e-8) * self.max_action_norm
 
-        # Predict next position under the proposed action
         next_pos = pos + self.dt * a_xy
 
-        # Check whether the next position enters any hazard disc
+        # Find the most conservative safe scale across all violated hazards
         needs_projection = False
         scale = 1.0
         for (hx, hy, hr) in self.hazards:
             d = np.linalg.norm(next_pos - np.array([hx, hy], dtype=np.float32))
             if d <= hr:
                 needs_projection = True
-                # Find the largest safe scale t in [0, 1] such that:
-                #   ||pos + dt * (t * a_xy) - (hx, hy)|| >= hr - epsilon
-                # We approximate this with a simple bisection search on t.
+                # Bisection: find the largest t in [0, 1] such that
+                #   ||pos + dt * (t * a_xy) - hazard_center|| >= hr - epsilon
+                # 20 iterations gives precision ~1e-6, which is more than enough
                 lo, hi = 0.0, 1.0
                 for _ in range(20):
                     mid = 0.5 * (lo + hi)
@@ -202,7 +193,6 @@ class GenericKeepoutShield:
             a_proj[:2] = a_xy * scale
             self.last_intervened = True
             self.interventions_in_episode += 1
-            # print(f"[Shield] INTERVENED: scale={scale:.3f}, pos={pos}, hazard approach detected")
             return a_proj
 
         return action

@@ -1,17 +1,19 @@
 """
-Small driver script for ablation runs.
-
-Builds a grid over a few safety knobs (shield, budgets, lambda LR, preferences, algo), 
-calls src.train / src.evaluate in subprocesses, and aggregates all metrics into one CSV.
-
 Launch and aggregate ablation studies for Safe RL experiments.
-So, this file is the outer loop that systematically probes the safety-performance trade-offs of the Safe RL stack described in the project.
+
+This script is the outer loop that systematically probes the safety-performance
+trade-offs of the Safe RL stack. It builds a grid over a few safety knobs
+(shield, cost budget, lambda learning rate, preference rewards, algorithm),
+calls src.train and src.evaluate as subprocesses for each configuration and
+seed, and aggregates all per-run metrics.csv files into a single summary CSV.
+
+All training logic lives in src.train; this script only orchestrates runs
+and collects results.
 """
 
 import argparse
 import os
 import subprocess
-# import itertools
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,13 +21,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def parse_args() -> argparse.Namespace:
     """
-    CLI flags for ablations (seeds, timesteps, output CSV, parallelism).
+    Parse CLI flags for the ablation launcher.
 
-    :return: Parsed command-line arguments.
+    We expose seeds, timesteps, output path, and parallelism as flags
+    so the ablation sweep is fully described by the command.
+
+    :return: Parsed args.
         :rtype: argparse.Namespace
     """
     ap = argparse.ArgumentParser(
-        description="Run ablations and aggregate Safe RL results"
+        description="Run ablations and aggregate Safe RL results."
     )
     ap.add_argument(
         "--seeds",
@@ -57,20 +62,19 @@ def parse_args() -> argparse.Namespace:
 
 def run_cmd(cmd: str, log_file: Optional[str] = None) -> None:
     """
-    Run a shell command, optionally logging stdout/stderr to a file.
+    Run a shell command, optionally redirecting stdout/stderr to a file.
 
-    Training and evaluation are launched as subprocesses to keep
-    this script simple and decoupled from the Python APIs of src.train and
-    src.evaluate. If any command fails, a CalledProcessError is raised.
+    Training and evaluation are launched as subprocesses to keep this script
+    decoupled from the Python APIs of src.train and src.evaluate.
+    If any command fails, CalledProcessError is raised and the run stops.
 
     :param cmd: Shell command to execute.
         :type cmd: str
-    :param log_file: Optional path to a file where stdout/stderr should be
-        redirected. If None, the output is inherited from the parent
-        process (i.e. printed to the console).
+    :param log_file: If provided, stdout and stderr are redirected here.
+        If None, output is printed to the console.
         :type log_file: Optional[str]
 
-    :return: This function does not return anything; it raises on error.
+    :return: None.
         :rtype: None
     """
     print(f"[Run] {cmd}")
@@ -89,40 +93,30 @@ def run_cmd(cmd: str, log_file: Optional[str] = None) -> None:
 
 def main():
     """
-    Main entry point for the ablation launcher.
+    Build and execute the ablation grid, then aggregate results.
 
-    High-level process:
-      1. Define an experiment grid over:
-         - shield on/off (LagPPO),
-         - Lagrangian learning rate (lr_lambda),
-         - cost budget (cost_budget),
-         - preference-based rewards on/off, and
-         - algorithm choice (PPO, SAC, RCPO baseline, LagPPO).
-      2. For each configuration and random seed, build:
-         - a training command (python -m src.train),
-         - an evaluation command (python -m src.evaluate),
-         and store them in a job list.
-      3. Execute the training (optionally in parallel) followed by evaluation.
-      4. Collect the resulting metrics.csv files into a single DataFrame
-         and write args.out_csv.
+    Steps:
+      1. Define an experiment grid over: shield on/off, lambda learning rate,
+         cost budget, preference rewards on/off, and algorithm choice
+      2. For each configuration and seed, build a training command and an
+         evaluation command and store them in a job list
+      3. Execute training jobs (optionally in parallel) followed by evaluation
+      4. Collect all metrics.csv files into a single DataFrame and save to
+         args.out_csv
 
-    This script assumes:
-      - checkpoints are saved by src.train under
-        checkpoints/<env_id>/<algo>/seed_<seed>/latest, and
-      - src.evaluate writes a`metrics.csv in each evaluation directory.
+    Checkpoints are expected at checkpoints/<env_id>/<algo>/seed_<seed>/latest,
+    which is where src.train saves them by default.
     """
     args = parse_args()
     os.makedirs("results", exist_ok=True)
 
-    # For now we fix the ablation environment. This matches the configuration described in the README
-    env_id: str = "SafetyPointPush1-v0"  # If needed this can be turned into a CLI flag
+    # Fixed environment for this ablation study, consistent with the paper
+    env_id: str = "SafetyPointPush1-v0"  # can be turned into a CLI flag if needed
     base_log: str = "logs/ablations"
 
     settings: List[Dict[str, Any]] = []
 
-    # Experiment grid over safety knobs and algorithm choice
-
-    # Shield on/off (with LagPPO)
+    # Shield on/off (LagPPO only, since unconstrained algorithms have no multiplier to interact with)
     for shield in [False, True]:
         settings.append(
             dict(
@@ -132,7 +126,7 @@ def main():
             )
         )
 
-    # Lagrangian learning rate (dual ascent step size)
+    # Lagrangian learning rate: how fast the multiplier responds to constraint violations
     for lr in [1e-4, 5e-4, 1e-3]:
         settings.append(
             dict(
@@ -142,7 +136,7 @@ def main():
             )
         )
 
-    # Cost budget (average per-step constraint)
+    # Cost budget: tighter budgets require the policy to learn safer behavior
     for budget in [0.01, 0.05, 0.1]:
         settings.append(
             dict(
@@ -162,7 +156,7 @@ def main():
             )
         )
 
-    # Algorithm comparison (PPO, SAC, RCPO baseline, LagPPO)
+    # Algorithm comparison across all four methods
     for algo in ["ppo", "sac", "rcpo", "lagppo"]:
         settings.append(
             dict(
@@ -171,9 +165,7 @@ def main():
             )
         )
 
-    # Prepare all jobs (train + eval)
-
-    # Each job is a tuple: (setting_dict, seed, train_cmd, eval_cmd, eval_dir)
+    # Build the full job list: one (train_cmd, eval_cmd) pair per setting and seed
     jobs: List[Tuple[Dict[str, Any], int, str, str, str]] = []
 
     for s in settings:
@@ -194,7 +186,6 @@ def main():
             )
             os.makedirs(eval_dir, exist_ok=True)
 
-            # Build training command consistent with src.train.parse_args
             train_cmd = (
                 f"python -m src.train --env_id {env_id} "
                 f"--algo {s.get('algo', 'lagppo')} "
@@ -208,10 +199,8 @@ def main():
             if "cost_budget" in s:
                 train_cmd += f" --cost_budget {s['cost_budget']}"
             if s.get("use_preferences", False):
-                # Fixed number of preference steps for this study
                 train_cmd += " --use_preferences --pref_steps 20000"
 
-            # Build evaluation command consistent with src.evaluate.parse_args
             eval_cmd = (
                 f"python -m src.evaluate --env_id {env_id} "
                 f"--model_path {ckpt} --episodes 10 --seed {seed} "
@@ -220,26 +209,22 @@ def main():
 
             jobs.append((s, seed, train_cmd, eval_cmd, eval_dir))
 
-    # Execute jobs (with optional parallelism)
-
+    # Execute jobs
     if args.parallel > 1:
-        # In parallel mode, we parallelize training runs and then evaluate each job as soon as its training finishes.
+        # Parallelise training; evaluate each run as soon as its training finishes
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             futures = {executor.submit(run_cmd, j[2]): j for j in jobs}
             for f in as_completed(futures):
                 s, seed, _, eval_cmd, _ = futures[f]
-                # Propagate any training error
-                f.result()
-                # Evaluate sequentially after training completes
+                f.result()  # re-raise any training error before evaluating
                 run_cmd(eval_cmd)
     else:
-        # Sequential mode: train then evaluate for each job
+        # Sequential: train then evaluate for each job in order
         for s, seed, train_cmd, eval_cmd, _ in jobs:
             run_cmd(train_cmd)
             run_cmd(eval_cmd)
 
-    # Aggregate results from all evaluation directories
-
+    # Collect results from all evaluation directories into one DataFrame
     records: List[Dict[str, Any]] = []
     for s, seed, _, _, eval_dir in jobs:
         metrics_csv = os.path.join(eval_dir, "metrics.csv")

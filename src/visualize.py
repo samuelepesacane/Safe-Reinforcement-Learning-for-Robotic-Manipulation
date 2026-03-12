@@ -1,13 +1,12 @@
 """
 Visualization entry point for Safe RL experiments.
 
-This script provides a simple CLI to:
-- Plot training learning curves from one or more log directories
-  (each expected to contain a metrics.csv file).
-- Visualize ablation summaries from the aggregated CSV produced
-  by src/ablations.py.
+Provides a simple CLI to plot training learning curves from one or more log
+directories, or to visualize ablation summaries from the aggregated CSV
+produced by src/ablations.py.
 
-All plotting logic lives in src.utils.plots. This module only parses arguments and delegates to those helpers.
+All plotting logic lives in src.utils.plots. This script only parses
+arguments and delegates to those helpers.
 """
 
 import argparse
@@ -18,25 +17,13 @@ from .utils.plots import plot_learning_curves, plot_ablations
 
 def parse_args() -> argparse.Namespace:
     """
-    Parse command-line arguments for visualization.
+    Parse CLI flags for visualization.
 
-    The user may supply:
-      - one or more training log directories (--log_dirs),
-      - a single ablations summary CSV (--ablations_csv),
-      - and an output directory for the generated figures (--out_dir).
+    Supply one or more training log directories, an ablations summary CSV,
+    or both. All generated figures are saved under --out_dir.
 
-    Examples
-    --------
-    Plot learning curves from two runs:
-
-        python -m src.visualize --log_dirs logs/run1 logs/run2 --out_dir results/plots
-
-    Plot ablation summary:
-
-        python -m src.visualize --ablations_csv results/ablations_summary.csv
-
-    :return: Parsed command-line arguments.
-    :rtype: argparse.Namespace
+    :return: Parsed args.
+        :rtype: argparse.Namespace
     """
     ap = argparse.ArgumentParser(
         description="Visualize Safe RL training curves and ablation results."
@@ -45,10 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--log_dirs",
         nargs="*",
         default=[],
-        help=(
-            "List of log directories containing metrics.csv "
-            "files (one per training run)."
-        ),
+        help="List of log directories, each containing a metrics.csv file.",
     )
     ap.add_argument(
         "--ablations_csv",
@@ -70,19 +54,11 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     """
-    Main entry point for visualization.
+    Generate plots from training logs or ablation results.
 
-    Depending on the provided arguments, this function will:
-
-      - Call plot_learning_curves if one or more --log_dirs
-        are specified. Each directory is expected to contain a
-        metrics.csv file with per-run training metrics.
-
-      - Call plot_ablations if --ablations_csv is specified.
-        This CSV is typically the output of src.ablations, aggregating
-        safety-performance metrics across a grid of configurations.
-
-    All generated figures are saved under --out_dir.
+    Calls plot_learning_curves if --log_dirs are specified, and
+    plot_ablations if --ablations_csv is specified. Both can be used
+    together in a single call.
     """
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)

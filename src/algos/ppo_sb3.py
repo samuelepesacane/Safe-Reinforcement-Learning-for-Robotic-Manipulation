@@ -10,28 +10,24 @@ def make_ppo(
     config: Optional[Dict[str, Any]] = None,
 ) -> PPO:
     """
-    Create a Stable-Baselines3 PPO model with sensible defaults for
-    continuous-control / MuJoCo-style environments.
+    Create a PPO model with sensible defaults for continuous-control environments.
 
-    This is a convenience factory: default hyperparameters can be overridden
-    via the `config` dictionary, and the resulting model is ready to be
-    trained in `train.py`.
+    This is a convenience factory used by train.py. Default hyperparameters
+    can be overridden via the config dictionary.
 
-    :param policy: Policy class name or identifier accepted by SB3's PPO
-        (e.g. "MlpPolicy").
-    :type policy: str
+    :param policy: Policy class name accepted by SB3's PPO (e.g. "MlpPolicy").
+        :type policy: str
     :param env: Environment instance or VecEnv compatible with SB3.
-    :type env: Any
+        :type env: Any
     :param tensorboard_log: Optional path for TensorBoard logs.
-    :type tensorboard_log: Optional[str]
+        :type tensorboard_log: Optional[str]
     :param seed: Random seed for the PPO model.
-    :type seed: int
-    :param config: Optional dictionary of PPO hyperparameters that overrides
-        the defaults defined in this function.
-    :type config: Optional[Dict[str, Any]]
+        :type seed: int
+    :param config: Optional PPO hyperparameters that override the defaults.
+        :type config: Optional[Dict[str, Any]]
 
     :return: Instantiated PPO model ready for training.
-    :rtype: stable_baselines3.PPO
+        :rtype: PPO
     """
     cfg: Dict[str, Any] = dict(
         n_steps=2048,
@@ -50,5 +46,4 @@ def make_ppo(
     if config is not None:
         cfg.update(config)
 
-    model: PPO = PPO(policy, env, **cfg)
-    return model
+    return PPO(policy, env, **cfg)

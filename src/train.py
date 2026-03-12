@@ -1,13 +1,16 @@
 """
-Train Safe RL agents on Safety-Gymnasium style tasks.
+Train Safe RL agents on Safety-Gymnasium tasks.
 
-This script glues together:
-- PPO / SAC backbones from Stable-Baselines3
-- a Lagrangian PPO (LagPPO) variant with a cost budget
-- a simple fixed-penalty RCPO-style baseline
-- optional geometric shielding and preference-based rewards
+This script glues together PPO, SAC, LagPPO, and a fixed-penalty RCPO baseline
+from Stable-Baselines3 with optional geometric shielding.
 
-The core idea is to study how different ways of enforcing safety behave under compute constraints on Safety-Gymnasium tasks.
+The core question being studied is how different safety enforcement strategies
+(Lagrangian constraints, fixed penalties, runtime shields) interact under realistic
+compute constraints on Safety-Gymnasium tasks.
+
+RCPO here is a simple fixed-penalty baseline: r' = r - penalty_coef * c.
+It is not the full multi-timescale algorithm from Tessler et al. (2018),
+but it serves as a useful static comparison point against adaptive methods like LagPPO.
 """
 
 import os
@@ -35,12 +38,14 @@ from gymnasium import RewardWrapper  # Used if algo == "rcpo"
 
 def parse_args() -> argparse.Namespace:
     """
-    CLI flags for training (env, algo, safety knobs, logging, etc.).
+    Parse CLI flags for training.
 
-    :return: Parsed command-line arguments.
-    :rtype: argparse.Namespace
+    We expose the main knobs as command-line flags so experiments are fully
+    described by the command: env, algorithm, safety hyperparameters, logging paths.
+
+    :return: Parsed args.
+        :rtype: argparse.Namespace
     """
-	
     ap = argparse.ArgumentParser(
         description="Train a (safe) RL agent with constrained exploration."
     )
@@ -128,6 +133,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="RCPO fixed penalty coefficient for cost shaping.",
     )
+    ap.add_argument(
+        "--ckpt_dir",
+        type=str,
+        default=None,
+        help="Override checkpoint directory. Defaults to checkpoints/<env_id>/<algo>/seed_<seed>.",
+    )
     return ap.parse_args()
 
 
@@ -135,49 +146,47 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
     """
     Build a factory that constructs a geometric keep-out shield for a given env.
 
-    The factory tries to introspect Safety-Gymnasium environments to find hazard
-    positions (e.g. env.unwrapped.world.hazards_pos) and uses them to build
-    a GenericKeepoutShield. If introspection fails, the shield is left
-    with an empty hazard list, effectively becoming a no-op.
-	
-	Personal note for a future update: the returned factory is actually what matters at runtime. It takes a concrete
-    environment instance, introspects its hazard layout (when available), and returns a configured GenericKeepoutShield. 
-	The env_id argument is currently not used in the logic, but it is kept so that future versions can specialize
-    the shield parameters for different tasks (e.g. different dt or hazard radii).
+    The returned factory is what matters at runtime: it takes a concrete environment
+    instance, introspects its hazard layout when available, and returns a configured
+    GenericKeepoutShield. The env_id argument is not used in the current logic but
+    is kept so future versions can specialize shield parameters per task
+    (e.g. different dt or hazard radii for different environments).
 
-    :param env_id: Environment ID (currently unused, but kept for future
-        environment-specific shield configuration).
-    :type env_id: str
+    If hazard introspection fails, the shield is left with an empty hazard list
+    and becomes a no-op rather than crashing.
+
+    :param env_id: Environment ID.
+        :type env_id: str
 
     :return: A callable that maps an environment instance to a configured shield.
-    :rtype: Callable[[Any], GenericKeepoutShield]
+        :rtype: Callable[[Any], GenericKeepoutShield]
     """
-
     if env_id.startswith("mujoco:"):
         from mujoco_connector import MujocoShield
         return lambda env: MujocoShield()
 
     def factory(env: Any) -> GenericKeepoutShield:
-        # Initialize with empty hazards
-        # we may fill them via env introspection
+        # Start with an empty hazard list; we fill it via introspection below
         shield = GenericKeepoutShield(
             hazards=[],
             dt=0.1,
             max_action_norm=float(np.max(env.action_space.high)),
         )
-        # attempt to read hazard positions from Safety-Gymnasium internals
+
+        # Safety-Gymnasium exposes hazard geometry through different attribute paths
+        # depending on the version. We try each path in order of preference.
         try:
             uw = env.unwrapped
 
             hazards_pos = None
-            hazards_size = 0.2  # Safety-Gymnasium default radius for point tasks
+            hazards_size = 0.2  # default radius for point tasks in Safety-Gymnasium
 
             if hasattr(uw, "task") and hasattr(uw.task, "hazards"):
                 h = uw.task.hazards
                 hazards_pos = getattr(h, "pos", None)
                 hazards_size = float(getattr(h, "size", 0.2))
             elif hasattr(uw, "task") and hasattr(uw.task, "hazards_pos"):
-                # Older Safety-Gymnasium layout where pos is directly on task
+                # Older Safety-Gymnasium layout where pos lives directly on task
                 hazards_pos = uw.task.hazards_pos
                 hazards_size = float(getattr(uw.task, "hazards_size", 0.2))
             elif hasattr(uw, "world") and hasattr(uw.world, "hazards_pos"):
@@ -186,7 +195,7 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
                 hazards_size = float(getattr(uw.world, "hazards_size", 0.2))
 
             if hazards_pos is not None and len(hazards_pos) > 0:
-                # pos entries are 3D arrays (x, y, z); we only need x, y for the 2D shield
+                # Hazard positions are 3D (x, y, z); the shield only needs x, y
                 hz = [(float(p[0]), float(p[1]), hazards_size) for p in hazards_pos]
                 shield.set_hazards(hz)
                 print(f"[Shield] loaded {len(hz)} hazards: {hz}")
@@ -203,22 +212,21 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
 
 def collect_random_rollouts(env_id: str, steps: int, seed: int) -> TrajectoryBuffer:
     """
-    Collect random trajectories from the environment for preference learning.
+    Collect random trajectories for building the preference dataset.
 
-    This function runs a random policy in the given environment and stores
-    trajectories of (observation, action, reward) triples in a
-    TrajectoryBuffer. These trajectories are later used to construct
-    synthetic preference pairs for training a reward model.
+    We run a random policy and store (obs, action, reward) triples in a
+    TrajectoryBuffer. These are later used to construct synthetic preference
+    pairs for training the reward model.
 
     :param env_id: ID of the environment to sample from.
-    :type env_id: str
+        :type env_id: str
     :param steps: Total number of environment steps to collect.
-    :type steps: int
+        :type steps: int
     :param seed: Random seed for the environment and buffer.
-    :type seed: int
+        :type seed: int
 
-    :return: A trajectory buffer containing the collected random rollouts.
-    :rtype: TrajectoryBuffer
+    :return: A trajectory buffer containing the collected rollouts.
+        :rtype: TrajectoryBuffer
     """
     env = make_env(env_id, seed=seed)
     buf = TrajectoryBuffer(segment_len=25, seed=seed)
@@ -243,19 +251,17 @@ def collect_random_rollouts(env_id: str, steps: int, seed: int) -> TrajectoryBuf
 
 def main():
     """
-    Main steps:
+    Orchestrate training for a single algorithm and shield condition.
+
+    Steps:
       1. Parse CLI arguments and set global seeds
       2. Optionally pre-train a preference-based reward model from random rollouts
-      3. Create a shared Lagrange multiplier (lambda) for LagPPO / RCPO shaping
+      3. Create a shared Lagrange multiplier (lambda) for LagPPO workers
       4. Build a vectorized environment with optional shield and reward shaping
       5. Instantiate the chosen algorithm (PPO, SAC, LagPPO, RCPO baseline)
       6. Train for the requested number of timesteps with logging callbacks
-
-    The function orchestrates all components without embedding algorithm-specific
-    logic, so that the same training loop can be used for different safe RL
-    configurations.
+      7. Save the final checkpoint and config for downstream evaluation
     """
-	
     args = parse_args()
     seed_everything(args.seed)
 
@@ -265,7 +271,7 @@ def main():
     logger = Logger(log_dir=args.log_dir, tb_dir=tb_dir)
     tensorboard_log = logger.tb_dir
 
-    # Preference model pre-training (offline)
+    # Preference model pre-training (offline, before the main training loop)
     pref_model: Optional[PreferenceReward] = None
     if args.use_preferences:
         print("Collecting random rollouts for preference dataset.")
@@ -279,7 +285,7 @@ def main():
             noise=0.1,
         )
 
-        # Determine observation dimensionality from a single sample
+        # Infer observation dimensionality from the first collected sample
         sample_obs: Optional[Any] = None
         for traj in buf.trajectories:
             if traj:
@@ -303,37 +309,36 @@ def main():
             device="cpu",
         )
 
-    # Shared lambda for SubprocVecEnv workers (important for LagPPO / RCPO)
+    # Shared lambda is updated by the Lagrangian callback and read by SubprocVecEnv workers.
+    # We use a multiprocessing Manager so the value is safely shared across processes.
     manager = mp.Manager()
-    # This value is updated during training by the Lagrangian callback
     shared_lambda = manager.Value("d", 0.0)
 
     def get_lambda_shared() -> float:
         """
-        Accessor for the current shared Lagrange multiplier.
+        Read the current shared Lagrange multiplier.
 
-        This function is passed to `make_env` so that reward shaping can use
-        the *current* value of lambda inside vectorized worker processes.
+        Passed to make_env so reward shaping inside worker processes always
+        sees the most recent lambda value from the callback.
+
+        :return: Current lambda value.
+            :rtype: float
         """
-		
         return shared_lambda.value
 
-    # === Environment factory ===
     def make_thunk(rank: int) -> Callable[[], Any]:
         """
         Build an initializer for a single environment instance.
 
-        The initializer:
-          - seeds the environment
-          - optionally adds a geometric shield
-          - optionally applies RCPO-style fixed-penalty shaping
-          - optionally replaces the reward with a learned preference model
+        Each worker gets a unique seed offset so environments are independent.
+        The initializer optionally adds a shield, RCPO reward shaping,
+        and a learned preference reward model.
 
-        :param rank: Index of the worker (used to offset the seed).
-        :type rank: int
+        :param rank: Worker index, used to offset the seed.
+            :type rank: int
 
         :return: A zero-argument callable that creates and wraps the environment.
-        :rtype: Callable[[], Any]
+            :rtype: Callable[[], Any]
         """
 
         def _init():
@@ -346,7 +351,7 @@ def main():
                     if args.use_shield
                     else None
                 ),
-                # If using LagPPO or RCPO we supply reward shaping via lambda.
+                # LagPPO and RCPO both need the current lambda for reward shaping
                 reward_shaping_get_lambda=(
                     get_lambda_shared
                     if args.algo in ["lagppo", "rcpo"]
@@ -355,23 +360,23 @@ def main():
             )
 
             if args.algo == "rcpo":
-                # NOTE:
-                # Here RCPO is implemented as a *simple fixed-penalty baseline*:
-                # we use a RewardWrapper that shapes rewards as
-                #
-                #   r' = r - penalty_coef * cost
-                #
-                # using a constant `penalty_coef` from the CLI. A more general
-                # RCPO pipeline (e.g. using `make_rcpo` from `src/algos/rcpo.py`)
-                # can be integrated in future versions.
+                # RCPO here is a fixed-penalty baseline: r' = r - penalty_coef * c.
+                # The penalty does not adapt during training, which makes it stable
+                # but less responsive to constraint violations than LagPPO.
+                # A more faithful RCPO pipeline can reuse make_rcpo from src/algos/rcpo.py.
 
                 class FixedPenalty(RewardWrapper):
                     """
                     Reward wrapper implementing r' = r - penalty_coef * cost.
 
-                    This is a minimal RCPO-style baseline that does not
-                    adapt the penalty coefficient during training. It is
-                    primarily intended for comparison with LagPPO.
+                    The penalty coefficient is fixed for the entire training run.
+                    This is intentionally simpler than the original RCPO algorithm,
+                    serving as a static comparison point against adaptive methods.
+
+                    :param env: Environment to wrap.
+                        :type env: Any
+                    :param penalty: Fixed penalty coefficient.
+                        :type penalty: float
                     """
 
                     def __init__(self, env: Any, penalty: float) -> None:
@@ -379,6 +384,15 @@ def main():
                         self.penalty: float = penalty
 
                     def step(self, action: Any):
+                        """
+                        Step the environment and apply the fixed cost penalty.
+
+                        :param action: Action from the policy.
+                            :type action: Any
+
+                        :return: (obs, shaped_reward, terminated, truncated, info).
+                            :rtype: tuple
+                        """
                         obs, r, term, trunc, info = self.env.step(action)
                         cost = float(info.get("cost", 0.0))
                         shaped = float(r) - self.penalty * cost
@@ -397,11 +411,12 @@ def main():
 
         return _init
 
-    # Vectorized environment (SubprocVecEnv if more than one env).
+    # Use SubprocVecEnv when running multiple workers for speed;
+    # DummyVecEnv is simpler and easier to debug for single-env runs
     vec_env_cls = SubprocVecEnv if args.num_envs > 1 else DummyVecEnv
     vec_env = vec_env_cls([make_thunk(i) for i in range(args.num_envs)])
-	
-	# Algorithm selection
+
+    # Algorithm selection
     lag_callback = None
     if args.algo == "ppo":
         model = make_ppo(
@@ -438,14 +453,14 @@ def main():
             seed=args.seed,
             config=None,
         )
-        # Expose 'shared_lambda' and custom logger to the callback so it can synchronize across workers
+        # Give the callback access to shared_lambda so it can synchronize
+        # the multiplier value across SubprocVecEnv worker processes
         lag_callback.shared_lambda_value = shared_lambda
         lag_callback.custom_logger = logger
 
     elif args.algo == "rcpo":
-        # At the moment, RCPO uses the fixed-penalty reward wrapper above and
-        # a standard PPO backbone (see note in make_thunk). A more faithful
-        # RCPO implementation can reuse `make_rcpo` from `src/algos/rcpo.py`
+        # RCPO uses the FixedPenalty wrapper above for reward shaping
+        # and a standard PPO backbone for optimization
         model = make_ppo(
             policy="MlpPolicy",
             env=vec_env,
@@ -457,37 +472,37 @@ def main():
 
     else:
         raise ValueError(f"Unsupported algo: {args.algo}")
-	
-	# Training
-    
+
+    # Training
     train_cb = TrainLoggingCallback(
         custom_logger=logger,
         log_freq=args.eval_freq,
+        cost_budget=args.cost_budget
     )
 
     callbacks = [train_cb]
     if lag_callback is not None:
         callbacks.append(lag_callback)
-	
+
     model.learn(
         total_timesteps=args.total_timesteps,
         callback=callbacks,
     )
-	
-	# Save latest checkpoint for downstream evaluation
-    ckpt_dir = os.path.join("checkpoints", args.env_id, args.algo, f"seed_{args.seed}")
+
+    # Save the final checkpoint so evaluate.py can load it with --model_path .../latest
+    ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else \
+        os.path.join("checkpoints", args.env_id, args.algo, f"seed_{args.seed}")
     os.makedirs(ckpt_dir, exist_ok=True)
     latest_path = os.path.join(ckpt_dir, "latest")
     model.save(latest_path)
     print(f"[train] Training done. Model saved to {latest_path}.zip")
-	
-	# Save config for reproducibility
+
+    # Save config alongside the checkpoint for reproducibility
     cfg = vars(args).copy()
     cfg["torch_version"] = torch.__version__
     cfg["numpy_version"] = np.__version__
     save_config(cfg, ckpt_dir)
 
-    # Clean up vectorized environment and logger
     vec_env.close()
     logger.close()
 
