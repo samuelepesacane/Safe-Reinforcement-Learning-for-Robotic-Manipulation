@@ -434,3 +434,8 @@ https://github.com/samuelepesacane/Safe-Reinforcement-Learning-for-Robotic-Manip
 ## License
 
 MIT License (see `LICENSE`).
+
+## AI assistance
+
+The writing and documentation in this repository were edited with the assistance of an AI language model. 
+All experimental design, implementation, results, and scientific conclusions are the authors' own.
