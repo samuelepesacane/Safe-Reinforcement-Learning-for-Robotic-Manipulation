@@ -84,30 +84,47 @@ class EvalCallback(BaseCallback):
             render=self.render,
         )
 
-        # Explicit rollout to accumulate cost, which evaluate_policy does not track
+        # Explicit rollout to accumulate cost and shield interventions,
+        # which evaluate_policy does not track
         costs = []
+        intervention_rates = []
         for _ in range(self.n_eval_episodes):
             obs, info = self.eval_env.reset()
             done = False
             ep_cost = 0.0
+            ep_interventions = 0
+            ep_steps = 0
             while not done:
                 action, _ = self.model.predict(obs, deterministic=self.deterministic)
                 obs, reward, terminated, truncated, info = self.eval_env.step(action)
                 ep_cost += float(info.get("cost", 0.0))
+                # shield_intervened is False when shield is disabled, so this
+                # always produces a valid rate (0.0) for non-shielded runs too
+                if info.get("shield_intervened", False):
+                    ep_interventions += 1
+                ep_steps += 1
                 done = bool(terminated or truncated)
             costs.append(ep_cost)
+            rate = ep_interventions / max(1, ep_steps)
+            intervention_rates.append(rate)
 
-        avg_return = float(np.mean(ep_returns))
-        avg_cost   = float(np.mean(costs))
+        avg_return            = float(np.mean(ep_returns))
+        avg_cost              = float(np.mean(costs))
+        avg_intervention_rate = float(np.mean(intervention_rates))
 
         if self.logger is not None:
             self.logger.record("eval/avg_return", avg_return)
             self.logger.record("eval/avg_cost", avg_cost)
+            self.logger.record("eval/shield_intervention_rate", avg_intervention_rate)
 
         if self.custom_logger is not None:
             try:
                 self.custom_logger.log_scalars(
-                    {"eval/avg_return": avg_return, "eval/avg_cost": avg_cost},
+                    {
+                        "eval/avg_return":            avg_return,
+                        "eval/avg_cost":              avg_cost,
+                        "eval/shield_intervention_rate": avg_intervention_rate,
+                    },
                     step=self.num_timesteps,
                 )
             except Exception as exc:

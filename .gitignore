@@ -19,6 +19,7 @@ results/
 checkpoints/
 MUJOCO_LOG.TXT
 
+
 # IDE
 .vscode/
 .idea/

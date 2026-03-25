@@ -88,6 +88,30 @@ def parse_args() -> argparse.Namespace:
         help="Enable geometric action shielding in the environment.",
     )
     ap.add_argument(
+        "--shield_type",
+        type=str,
+        default="geometric",
+        choices=["geometric", "riemannian"],
+        help=(
+            "Which shield to use when --use_shield is set. "
+            "'geometric' is the bisection-based keepout shield. "
+            "'riemannian' is the gradient-based barrier shield inspired by "
+            "Jaquier et al. IROS 2023."
+        ),
+    )
+    ap.add_argument(
+        "--shield_alpha",
+        type=float,
+        default=0.1,
+        help="Gradient scaling coefficient for the Riemannian shield.",
+    )
+    ap.add_argument(
+        "--shield_influence_radius",
+        type=float,
+        default=0.5,
+        help="Influence radius (beyond hazard boundary) for the Riemannian shield.",
+    )
+    ap.add_argument(
         "--use_preferences",
         action="store_true",
         help="Use a learned preference-based reward model instead of env reward.",
@@ -142,21 +166,40 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
+def build_shield_factory(
+    env_id: str,
+    shield_type: str = "geometric",
+    alpha: float = 0.1,
+    influence_radius: float = 0.5,
+) -> Callable[[Any], GenericKeepoutShield]:
     """
-    Build a factory that constructs a geometric keep-out shield for a given env.
+    Build a factory that constructs a keepout shield for a given env.
 
     The returned factory is what matters at runtime: it takes a concrete environment
     instance, introspects its hazard layout when available, and returns a configured
     GenericKeepoutShield. The env_id argument is not used in the current logic but
     is kept so future versions can specialize shield parameters per task
     (e.g. different dt or hazard radii for different environments).
+    Two shield types are supported. The geometric shield uses bisection to
+    project actions away from hazards when the predicted next position would
+    enter one. The Riemannian shield uses a gradient-based barrier potential
+    summed over all hazards simultaneously, inspired by the region-avoiding
+    Riemannian metric construction in Jaquier et al. IROS 2023. The Riemannian
+    shield handles dense hazard fields more gracefully because it reasons about
+    the global hazard geometry rather than the nearest single hazard.
 
-    If hazard introspection fails, the shield is left with an empty hazard list
-    and becomes a no-op rather than crashing.
+    If hazard introspection fails, either shield degrades to a pass-through
+    rather than crashing.
 
     :param env_id: Environment ID.
         :type env_id: str
+    :param shield_type: Either "geometric" or "riemannian".
+        :type shield_type: str
+    :param alpha: Gradient scaling coefficient for the Riemannian shield.
+        :type alpha: float
+    :param influence_radius: Influence radius beyond hazard boundary for the
+        Riemannian shield.
+        :type influence_radius: float
 
     :return: A callable that maps an environment instance to a configured shield.
         :rtype: Callable[[Any], GenericKeepoutShield]
@@ -165,13 +208,30 @@ def build_shield_factory(env_id: str) -> Callable[[Any], GenericKeepoutShield]:
         from mujoco_connector import MujocoShield
         return lambda env: MujocoShield()
 
+    # Import here so the Riemannian shield is only required when requested,
+    # keeping the geometric-only path free of the extra dependency
+    if shield_type == "riemannian":
+        from .safety.riemannian_shield import RiemannianShield
+
     def factory(env: Any) -> GenericKeepoutShield:
-        # Start with an empty hazard list; we fill it via introspection below
-        shield = GenericKeepoutShield(
-            hazards=[],
-            dt=0.1,
-            max_action_norm=float(np.max(env.action_space.high)),
-        )
+        max_norm = float(np.max(env.action_space.high))
+
+        # Instantiate the requested shield type with an empty hazard list;
+        # hazards are filled in below via environment introspection
+        if shield_type == "riemannian":
+            shield = RiemannianShield(
+                hazards=[],
+                dt=0.1,
+                max_action_norm=max_norm,
+                alpha=alpha,
+                influence_radius=influence_radius
+            )
+        else:
+            shield = GenericKeepoutShield(
+                hazards=[],
+                dt=0.1,
+                max_action_norm=max_norm
+            )
 
         # Safety-Gymnasium exposes hazard geometry through different attribute paths
         # depending on the version. We try each path in order of preference.
@@ -347,7 +407,12 @@ def main():
                 seed=args.seed + 1000 * rank,
                 use_shield=args.use_shield,
                 shield_factory=(
-                    build_shield_factory(args.env_id)
+                    build_shield_factory(
+                        args.env_id,
+                        shield_type=args.shield_type,
+                        alpha=args.shield_alpha,
+                        influence_radius=args.shield_influence_radius
+                    )
                     if args.use_shield
                     else None
                 ),
@@ -480,6 +545,9 @@ def main():
         cost_budget=args.cost_budget
     )
 
+    # EvalCallback (src/callbacks/eval_callback.py) provides a separate held-out
+    # eval loop and is available but not wired here. TrainLoggingCallback covers
+    # the metrics needed for the current ablation study
     callbacks = [train_cb]
     if lag_callback is not None:
         callbacks.append(lag_callback)
