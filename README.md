@@ -1,19 +1,36 @@
 # Safe Reinforcement Learning for Robotic Manipulation
 
-**Paper:** [Geometric Shielding and Lagrangian Constraints are Complementary: An Empirical Study in Safe Reinforcement Learning](https://github.com/samuelepesacane/Safe-Reinforcement-Learning-for-Robotic-Manipulation/)
+**Paper:** [Geometric Shielding and Lagrangian Constraints in Safe Reinforcement Learning: A Factorial Study](https://doi.org/10.5281/zenodo.22356926)
 
 This repository contains the code for the ablation study described in the paper above.
-It implements four safe RL algorithms (PPO, SAC, RCPO, LagPPO) with and without a geometric keepout shield, evaluated on the SafetyPointPush1-v0 benchmark from Safety-Gymnasium.
+It implements four safe RL algorithms (PPO, SAC, RCPO with fixed $\lambda$, LagPPO) with and without an action-shielding wrapper, evaluated on the SafetyPointPush1-v0 benchmark from Safety-Gymnasium.
+
+> **Important:** the shield was intended to be a geometric keep-out shield, but a defect (see [Known defects](#known-defects)) meant it never evaluated hazard geometry. All shield-on results should be read as an action-perturbation baseline.
 
 ## Project status & context
 
 This is a research prototype on a single 8GB-GPU machine.
 The focus is:
 
-- studying how Lagrangian CMDPs, fixed penalties (RCPO-style), and geometric shields trade off return vs safety
+- studying how Lagrangian CMDPs, fixed penalties (RCPO-style), and action shields trade off return vs safety
 - keeping the code small and readable so it is easy to change and extend
 
-RCPO is implemented as a fixed-penalty baseline rather than the full multi-timescale algorithm described in the original paper. It serves as a static penalty comparison point, not a faithful reproduction of Tessler et al. (2018).
+RCPO is implemented as a fixed-penalty baseline rather than the full multi-timescale algorithm described in the original paper. It serves as a static penalty comparison point, not a faithful reproduction of Tessler et al. (2018). It is referred to as **RCPO (fixed $\lambda$)** throughout.
+
+## Known defects
+
+**D1 — the shield does not evaluate hazard geometry.**
+`src/safety/shield.py` extracts the agent's position by taking the first two components of the observation vector. On `SafetyPointPush1-v0` the 76-dimensional observation consists of sensor readings and pseudo-lidar values and contains **no absolute position**, so those two components are accelerometer readings rather than coordinates. The keep-out test was therefore evaluated on the wrong quantity throughout.
+
+The extraction never raises, so the pass-through branch intended to handle unrecognised observation formats never fired, and the wrapper intervened at the rates reported in the paper. Those interventions were real modifications of the policy's proposed actions, but they were not geometry-aware.
+
+Consequences:
+
+- This repository and its paper **do not evaluate geometric shielding**. All shield-on conditions are an action-perturbation baseline.
+- Unaffected results: the collapse of the fixed-penalty condition, the failure of every method to satisfy the cost budget within 1M steps, the low cost of unconstrained SAC, and the seed-variance findings.
+- Affected results: anything involving the shield remains valid as an observation about this perturbation, but cannot be attributed to keep-out behaviour.
+
+The released code and logs correspond to the experiments as described in the paper. A corrected study is future work; the defect is disclosed rather than silently patched so that the artefacts remain reproducible.
 
 ## Experimental results
 
@@ -25,14 +42,16 @@ The main results of the 4$\times$2 factorial ablation (4 algorithms $\times$ shi
 | PPO shield_on | 0.68 ± 0.21 | 48.3 ± 45.5 | 0.25 ± 0.16 | 323.6 |
 | SAC shield_off | 1.07 ± 0.11 | 21.2 ± 17.0 | 0.13 ± 0.00 | 200.5 |
 | SAC shield_on | 0.95 ± 0.12 | 57.3 ± 56.0 | 0.15 ± 0.14 | 416.0 |
-| RCPO shield_off | -0.90 ± 0.44 | 3.6 ± 3.8 | 0.08 ± 0.10 | 26.1 |
-| RCPO shield_on | -0.26 ± 0.44 | 5.6 ± 8.1 | 0.03 ± 0.05 | 56.3 |
+| RCPO (fixed $\lambda$) shield_off | -0.90 ± 0.44 | 3.6 ± 3.8 | 0.08 ± 0.10 | 26.1 |
+| RCPO (fixed $\lambda$) shield_on | -0.26 ± 0.44 | 5.6 ± 8.1 | 0.03 ± 0.05 | 56.3 |
 | LagPPO shield_off | 0.78 ± 0.23 | 49.8 ± 27.9 | 0.30 ± 0.15 | 314.8 |
 | LagPPO shield_on | 0.84 ± 0.57 | 34.7 ± 28.6 | 0.22 ± 0.10 | 285.8 |
 
 Key findings:
-- RCPO achieves the lowest violation rate and CVaR but suppresses task performance almost entirely
-- Geometric shielding and Lagrangian constraints are complementary: adding a shield measurably reduces Lagrange multiplier growth in LagPPO
+
+- RCPO (fixed $\lambda$) achieves the lowest violation rate and CVaR but suppresses task performance almost entirely
+- Because each seed fixes the hazard layout, conditions can be compared on matched geometry. Under that pairing, shielded LagPPO ends with a lower Lagrange multiplier than its unshielded twin in all three seed pairs, and PPO is perturbed by the wrapper more often than LagPPO in all three. Both orderings are consistent in direction, but their marginal ranges overlap and three seeds do not resolve their magnitude
+- $\lambda$ never exceeds 0.0075 within 1M steps at $\eta_{\lambda} = 5e-4$, so the constraint never acquires strong authority over the policy; LagPPO is close to lightly penalised PPO in the evaluation results
 - No algorithm achieves zero violations within 1M training steps
 
 ## Project Overview
@@ -52,7 +71,7 @@ Safe RL is one of the main bottlenecks for real robots: you want the agent to ex
 This repo combines a few simple ideas:
 
 - **Lagrangian CMDPs**: treat safety as a cost with a budget and update a Lagrange multiplier online.
-- **Geometric shields**: a small 2D keep-out module that projects actions away from known hazards.
+- **Geometric shields**: a small 2D keep-out module *intended* to project actions away from known hazards. As implemented it does not do this — see [Known defects](#known-defects).
 
 The point is not to squeeze out the best possible score, but to understand how these pieces interact under realistic compute constraints.
 
@@ -63,7 +82,7 @@ The point is not to squeeze out the best possible score, but to understand how t
 - `src/ablations.py`: small ablation launcher (wraps train + eval)
 - `src/envs/make_env.py`: environment factory (Safety-Gymnasium) + shield wiring
 - `src/algos/lagppo.py`: Lagrangian PPO (`LagrangianState`, callback)
-- `src/safety/shield.py`: geometric keep-out shield for 2D point/car robots
+- `src/safety/shield.py`: intended geometric keep-out shield for 2D point/car robots — **contains defect D1, see [Known defects](#known-defects)**
 - `src/safety/metrics.py`: helpers to aggregate returns/costs/violation rate/CVaR
 - `scripts/quickstart.sh`: one small LagPPO + shield run on `SafetyPointPush1-v0`
 - `run_full_ablation.sh`: runs all 24 conditions and saves logs
@@ -87,6 +106,8 @@ These environments provide:
 - **Reward** for doing the task (reach goal, push box, press button)
 - **Cost** for unsafe events (stepping into hazard regions)
 - **Budget** that algorithms like LagPPO or RCPO attempt to respect
+
+Note that these observation spaces are sensor readings and pseudo-lidar only; they contain no absolute agent coordinates. This is the root of defect D1.
 
 ## Gymnasium-Robotics Environments
 
@@ -204,7 +225,7 @@ python -m src.train \
 `MujocoRoboticEnv` cannot be pickled across subprocesses, so `SubprocVecEnv` will crash.
 
 **The shield is a pass-through.**
-`MujocoShield` satisfies the `ShieldingActionWrapper` interface but does not do geometry-based action projection. The existing 2D geometric shield is designed for point robots in a flat plane and is not directly applicable to a 3D arm.
+`MujocoShield` satisfies the `ShieldingActionWrapper` interface but does not do geometry-based action projection. The existing 2D shield is designed for point robots in a flat plane and is not directly applicable to a 3D arm.
 
 **Tested on MuJoCo 2.3.0.**
 The `mujoco.viewer` module was added in 2.3.7. On 2.3.0, rendering is skipped silently.
@@ -341,9 +362,9 @@ The most important flags:
 
 - `--env_id`: which Safety-Gymnasium env to use
 - `--algo`: `ppo`, `sac`, `lagppo`, `rcpo`
-- `--use_shield`: turn the geometric shield on
+- `--use_shield`: turn the shield wrapper on
 - `--cost_budget`, `--lr_lambda`: Lagrangian CMDP hyperparameters
-- `--penalty_coef`: fixed penalty coefficient for RCPO
+- `--penalty_coef`: fixed penalty coefficient for RCPO (fixed $\lambda$)
 
 Example commands:
 
@@ -384,7 +405,7 @@ python -m src.visualize --log_dirs logs/pointpush_lagppo logs/pointpush_ppo \
   * `runs/` (TensorBoard)
   * `results/` (plots, metrics CSV)
   * `checkpoints/` (trained models)
-- Three-seed protocol with shaded 95% confidence intervals in plots
+- Three-seed protocol with shaded bootstrapped 95% intervals in plots. Note that at n=3 the percentile bootstrap interval is bounded by the extreme seeds and does not have nominal coverage; its width is empirically 0.9–1.0× the sample standard deviation, so read it as a seed-spread indicator
 
 ## Troubleshooting
 
@@ -396,7 +417,8 @@ python -m src.visualize --log_dirs logs/pointpush_lagppo logs/pointpush_ppo \
 
 Roughly in order of priority:
 
-- **LagPPO stability**: more systematic sweep over `--cost_budget` and `--lr_lambda`; saved default configs per env
+- **Fix D1**: extract agent position from a source that actually contains it, verify the keep-out test against ground-truth coordinates, and rerun the 12 shield-on conditions
+- **LagPPO authority**: sweep `--lr_lambda` and `--cost_budget` so that $\lambda$ reaches a magnitude that measurably reshapes the policy
 - **Environment coverage**: properly test and document SafetyPointButton1-v0, SafetyCarPush1-v0, FetchPush-v2
 - **Training quality of life**: add checkpointing + resume (including Lagrange multiplier state); improve logging
 - **Longer-term**: more seeds, more environments, evaluation on additional Safety-Gymnasium tasks
@@ -426,9 +448,9 @@ This is not implemented yet.
 If you use this repository in academic work, please cite the paper (see `CITATION.cff`) or:
 
 ```
-Pesacane, S. (2026). Geometric Shielding and Lagrangian Constraints are Complementary:
-An Empirical Study in Safe Reinforcement Learning.
-https://github.com/samuelepesacane/Safe-Reinforcement-Learning-for-Robotic-Manipulation/
+Pesacane, S. (2026). Geometric Shielding and Lagrangian Constraints in Safe
+Reinforcement Learning: A Factorial Study. Zenodo.
+https://doi.org/10.5281/zenodo.22356926
 ```
 
 ## License
@@ -438,4 +460,4 @@ MIT License (see `LICENSE`).
 ## AI assistance
 
 The writing and documentation in this repository were edited with the assistance of an AI language model. 
-All experimental design, implementation, results, and scientific conclusions are the authors' own.
+All experimental design, implementation, results, and scientific conclusions are the author's own.

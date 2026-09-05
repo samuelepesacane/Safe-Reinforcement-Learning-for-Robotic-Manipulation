@@ -5,6 +5,7 @@ authors:
     given-names: "Samuele"
 date-released: 2025-12-15
 version: "1.0.0"
+doi: "https://doi.org/10.5281/zenodo.22356926"
 repository-code: "https://github.com/samuelepesacane/Safe-Reinforcement-Learning-for-Robotic-Manipulation"
 message: "If you use this software, please cite it using this metadata."
 keywords:
