@@ -1,0 +1,7 @@
+# This repo is edited on Windows but executed under WSL/Linux.
+# Without this, core.autocrlf=true checks the shell scripts out with CRLF, which
+# breaks them in two ways: a "#!/bin/bash\r" shebang makes direct execution fail
+# with "cannot execute: required file not found", and when invoked as
+# "bash script.sh" the trailing CR turns "set -e" into an invalid option, so the
+# script keeps running past failures instead of aborting.
+*.sh text eol=lf
