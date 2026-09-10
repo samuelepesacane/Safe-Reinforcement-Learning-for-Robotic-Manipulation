@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "FROZEN 2026-08-07. Do not edit these values.",
+    "Calibrated on the labelled set of 27 pre-existing LagPPO runs (car = not-settled,",
+    "PointGoal = settled; PointPush excluded as unlabelled -- it is inconsistent in both",
+    "directions and must not drive thresholds). That labelled set is disjoint from every",
+    "run in the new experimental program.",
+    "S1 was specified before any data was inspected. S2's FORM was chosen after inspecting",
+    "the labelled set, because S1 does not separate car from PointGoal at all while S2",
+    "separates 9/9 with zero overlap. This is disclosed in the paper; see",
+    "CODE_AUDIT_AND_EXECUTION_PLAN.md section 4.3.",
+    "Changing any number here after new data exists invalidates the pre-registration."
+  ],
+  "frozen_on": "2026-08-07",
+  "window_fraction": 0.2,
+  "settled": {
+    "s1_max": 0.10,
+    "s2_max": 0.40
+  },
+  "climbing": {
+    "s2_min": 0.65
+  },
+  "limit_cycle": {
+    "s1_max": 0.10,
+    "s3_min": 0.05
+  },
+  "authority_void": {
+    "s5_min": 0.20
+  }
+}
