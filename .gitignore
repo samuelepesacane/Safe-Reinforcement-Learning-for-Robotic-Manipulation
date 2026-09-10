@@ -16,6 +16,7 @@ logs/
 runs/
 videos/
 results/
+!results/analysis/
 checkpoints/
 MUJOCO_LOG.TXT
 
