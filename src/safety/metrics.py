@@ -46,6 +46,9 @@ def aggregate_episode_metrics(
     - "cost": episodic safety cost (float)
     - "length": number of steps in the episode (int)
     - "interventions": number of shield interventions (int)
+    - "gradient_interventions": number of those interventions that were the
+      gradient stage (RiemannianShield only; optional, defaults to 0 so older
+      episode dicts / GenericKeepoutShield / no-shield runs are unaffected)
     - "success": whether the episode achieved the task goal (bool)
 
     The function computes:
@@ -56,6 +59,8 @@ def aggregate_episode_metrics(
     - per_step_cost: total cost divided by total number of steps
     - cvar_cost_alpha_0.1: CVaR at alpha=0.1 over episodic costs
     - avg_interventions: mean number of interventions per episode
+    - avg_gradient_interventions: mean number of gradient-stage interventions
+      per episode (0 if not tracked)
     - success_rate: fraction of successful episodes
     - return_under_budget: mean return among episodes whose average cost per
       step is <= constraint_budget (if a budget is provided)
@@ -75,6 +80,7 @@ def aggregate_episode_metrics(
     lengths       = [int(ep.get("length", 0)) for ep in episodes]
     successes     = [bool(ep.get("success", False)) for ep in episodes]
     interventions = [int(ep.get("interventions", 0)) for ep in episodes]
+    gradient_interventions = [int(ep.get("gradient_interventions", 0)) for ep in episodes]
 
     avg_return = float(np.mean(returns)) if returns else 0.0
     avg_cost   = float(np.mean(costs)) if costs else 0.0
@@ -92,6 +98,9 @@ def aggregate_episode_metrics(
 
     cvar_cost         = cvar(costs, alpha=0.1)
     avg_interventions = float(np.mean(interventions)) if interventions else 0.0
+    avg_gradient_interventions = (
+        float(np.mean(gradient_interventions)) if gradient_interventions else 0.0
+    )
     success_rate      = float(np.mean(successes)) if successes else 0.0
 
     # Mean return conditioned on respecting the cost budget per step.
@@ -116,6 +125,7 @@ def aggregate_episode_metrics(
         "per_step_cost":        per_step_cost,
         "cvar_cost_alpha_0.1":  cvar_cost,
         "avg_interventions":    avg_interventions,
+        "avg_gradient_interventions": avg_gradient_interventions,
         "success_rate":         success_rate,
         "return_under_budget":  ret_under_budget,
     }
