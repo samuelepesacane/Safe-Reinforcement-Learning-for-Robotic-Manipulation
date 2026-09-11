@@ -19,23 +19,47 @@ at each step, which is too expensive for a runtime RL shield. This module
 implements the first-order approximation: at each step, we compute the
 repulsive direction of the barrier potential (the negative gradient, which
 points away from hazards) at the current position and add it to the proposed
-action. This deflects the action away from hazards in proportion to
-proximity, reproducing the qualitative behavior of the metric-modified geodesic
-without the full geodesic computation.
+action.
 
 The barrier weight uses an inverse-square form:
     w_i(pos) = max(0, 1 / (d_i - r_i)^2)
 where d_i is the Euclidean distance from pos to hazard center i and r_i is its
 radius. The gradient of this scalar field with respect to pos is the deflection
-signal. This is a smooth, differentiable barrier that grows continuously to
-infinity as the robot approaches the hazard boundary, unlike the hard truncation
-in the bisection-based GenericKeepoutShield.
+signal, and its magnitude is |grad_i| = 2/clearance^3 (the 1/d factor in the
+code's formula cancels exactly against the diff vector's own magnitude d).
+
+IMPORTANT, found in review after D3's sign/clip fix landed: this magnitude
+formula means the deflection is NOT proximity-proportional in practice, for
+any influence_radius actually used in this project (0.2-0.5). At the weakest
+possible interaction -- clearance == influence_radius, right at the outer edge
+of the zone -- |grad| is already 16-250x max_action_norm=1.0 (see the table in
+SESSION_HANDOFF.md). Since the norm clip (see RiemannianShield.step) is
+applied to this raw gradient BEFORE alpha scales it, alpha cannot change
+whether the clip fires -- only clearance vs max_action_norm can, and clearance
+never gets large enough not to trigger it at these settings. Empirically, the
+clip fires in 100% of gradient interventions on both SafetyPointGoal1-v0 and
+SafetyCarGoal1-v0 (measured over a 5k-step probe at alpha=0.1,
+influence_radius=0.4). So in practice this shield is a smoothly-varying-
+DIRECTION, fixed-MAGNITUDE (alpha*max_action_norm) correction inside
+influence_radius, and exactly zero outside it -- a soft trigger boundary with
+a hard-capped push, not a force that grows continuously with proximity the way
+the paragraph above (and the class docstring) describe the underlying barrier
+potential's mathematical form. The direction remains correct and continuous;
+only the magnitude does not vary with proximity in the operating range used
+here. Getting genuine proximity-modulation would require either clipping the
+alpha-scaled deflection instead of the raw gradient, or an alpha small enough
+that alpha*max(|grad| over the zone) <= max_action_norm -- for influence_radius
+in {0.2, 0.3, 0.4, 0.5} that threshold alpha is {0.004, 0.0135, 0.032, 0.0625}
+respectively, well below the values used in this project's runs, and small
+enough that the resulting deflection ceiling (a few percent of the action
+range) may be too weak to matter.
 
 The key qualitative difference from GenericKeepoutShield is that this shield
-produces a continuous gradient-based deflection that acts at a distance, rather
-than a binary projection that only activates when the next predicted position
-would enter the hazard. This means the shield intervenes more gently and more
-often, which is closer in spirit to how a metric-modified geodesic behaves.
+triggers earlier (at influence_radius beyond the hazard boundary, rather than
+only when the predicted next position would actually enter the hazard) and,
+within that trigger zone, corrects direction using the true barrier geometry
+rather than GenericKeepoutShield's isotropic scale-down. It does not, in
+practice, intervene "more gently" -- see above.
 """
 
 from typing import List, Optional, Tuple, Any
@@ -52,13 +76,23 @@ class RiemannianShield(GenericKeepoutShield):
     next position would enter a hazard, this shield computes the repulsive
     direction (negative gradient) of a barrier potential field at the current
     position and adds it to the proposed action. The barrier potential is the
-    sum of inverse-square terms centered at each hazard, so the deflection
-    grows smoothly as the robot approaches any hazard boundary.
+    sum of inverse-square terms centered at each hazard, and its gradient's
+    DIRECTION does follow the true barrier geometry continuously as the robot
+    moves. Its MAGNITUDE does not, in practice: see the module docstring --
+    at the influence_radius values used in this project (0.2-0.5), the raw
+    gradient's norm exceeds max_action_norm even at the outer edge of the
+    zone, so the norm clip saturates on essentially every intervention
+    (measured: 100% of gradient interventions in a 5k-step probe on both
+    robots). The result is a fixed-magnitude (alpha*max_action_norm),
+    correctly-directed correction inside influence_radius and nothing outside
+    it, not a force that grows with proximity.
 
     This is a first-order approximation of the geodesic deflection that would
     arise under Jaquier et al.'s modified metric. It is computationally cheap
-    (one gradient evaluation per step) and produces smooth, continuous
-    interventions rather than hard truncations.
+    (one gradient evaluation per step). Whether an individual step's
+    correction is "smooth" relative to GenericKeepoutShield's hard truncation
+    depends on what varies: direction varies continuously here; magnitude, in
+    the saturated regime this project runs in, does not.
 
     The fallback to the parent class bisection is retained for cases where the
     gradient deflection alone is insufficient: if after gradient deflection the
@@ -74,11 +108,21 @@ class RiemannianShield(GenericKeepoutShield):
     :param epsilon: Safety margin kept between predicted position and boundary.
         :type epsilon: float
     :param alpha: Scaling coefficient for the barrier gradient deflection.
-        Larger values produce stronger deflection at a given distance.
+        Because the norm clip is applied to the raw gradient BEFORE alpha
+        scales it (see step()), alpha does not change whether the clip fires
+        -- only clearance vs max_action_norm does, and at the influence_radius
+        values used in this project it fires ~100% of the time regardless of
+        alpha. In that saturated regime alpha is simply the deflection
+        magnitude ceiling (alpha*max_action_norm), not a proximity-sensitivity
+        knob.
         :type alpha: float
     :param influence_radius: Only hazards closer than this distance (beyond
         their radius) contribute to the gradient. Acts as a soft cutoff so
-        distant hazards do not affect the action at all.
+        distant hazards do not affect the action at all. Empirically the
+        dominant driver of intervention RATE (see SESSION_HANDOFF.md's
+        influence_radius scan) -- alpha and influence_radius affect different
+        things: alpha sets how hard a triggered correction pushes (capped, per
+        the note above), influence_radius sets how often it triggers at all.
         :type influence_radius: float
     """
 
@@ -101,6 +145,32 @@ class RiemannianShield(GenericKeepoutShield):
         # Only hazards within this extra clearance beyond their radius
         # contribute gradient, so the shield is quiet far from obstacles
         self.influence_radius = influence_radius
+
+        # Diagnostics specific to the gradient stage, separate from the
+        # inherited last_deflection_magnitude (which measures the TOTAL
+        # action change across both the gradient stage and any bisection
+        # fallback -- conflating the two was a bug: with max_action_norm=1.0
+        # this shield's raw gradient is |grad|=2/clearance^3, which already
+        # exceeds max_action_norm at clearance=influence_radius for every
+        # influence_radius below ~1.26, so the norm clip saturates almost
+        # every intervention and last_gradient_deflection_magnitude sits at
+        # exactly alpha*max_action_norm most of the time. See
+        # last_gradient_clip_fired for whether this step was one of them.
+        self.last_gradient_deflection_magnitude: float = 0.0
+        self.last_gradient_clip_fired: bool = False
+        # True iff the gradient stage itself intervened this step (grad_norm >
+        # 1e-8), independent of whether the bisection fallback also fired.
+        # Lets a caller compute the clip-fire fraction CONDITIONAL on a
+        # gradient intervention having happened, rather than diluted by all
+        # the steps -- including bisection-only ones -- where it did not.
+        self.last_gradient_intervened: bool = False
+
+    def on_reset(self) -> None:
+        """Reset episode-level state, including the Riemannian-specific diagnostics."""
+        super().on_reset()
+        self.last_gradient_deflection_magnitude = 0.0
+        self.last_gradient_clip_fired = False
+        self.last_gradient_intervened = False
 
     def _barrier_gradient(self, pos: np.ndarray) -> np.ndarray:
         """
@@ -158,9 +228,12 @@ class RiemannianShield(GenericKeepoutShield):
 
         First computes the repulsive barrier direction at the current position
         and adds alpha * (norm-clipped repulsive direction) to the XY action
-        components. This deflects the action away from nearby hazards
-        continuously and proportionally to proximity, approximating the
-        deflection that would arise under Jaquier et al.'s modified metric.
+        components. Direction varies continuously with position; magnitude
+        does not, in the regime this project runs in -- the norm clip
+        saturates on ~100% of gradient interventions at the influence_radius
+        values used here (see the module docstring), so the deflection is a
+        fixed-magnitude (alpha*max_action_norm) push in the correct direction
+        rather than a force that grows with proximity.
 
         If the deflected action still predicts a next position inside a hazard
         (which can happen very close to boundaries), the parent class bisection
@@ -175,6 +248,9 @@ class RiemannianShield(GenericKeepoutShield):
             :rtype: np.ndarray
         """
         self.last_intervened = False
+        self.last_gradient_deflection_magnitude = 0.0
+        self.last_gradient_clip_fired = False
+        self.last_gradient_intervened = False
 
         if not self.hazards:
             return action
@@ -201,13 +277,24 @@ class RiemannianShield(GenericKeepoutShield):
             # fixed-magnitude, 45-degree-aligned nudge regardless of true
             # proximity or direction. Clipping the norm instead caps the
             # magnitude while preserving the true direction.
-            if grad_norm > self.max_action_norm:
+            #
+            # NOTE: this clip is on the RAW gradient, before alpha scales it,
+            # so whether it fires does not depend on alpha at all -- only on
+            # clearance vs max_action_norm. See last_gradient_clip_fired.
+            self.last_gradient_clip_fired = bool(grad_norm > self.max_action_norm)
+            if self.last_gradient_clip_fired:
                 grad = grad * (self.max_action_norm / grad_norm)
             deflection = self.alpha * grad
             a_deflected = a.copy()
             a_deflected[:2] = a[:2] + deflection
             self.last_intervened = True
+            self.last_gradient_intervened = True
             self.interventions_in_episode += 1
+            # Gradient-stage magnitude only, bounded by alpha*max_action_norm --
+            # NOT the total action change (see last_deflection_magnitude below,
+            # which also includes any bisection fallback and was previously
+            # the only magnitude reported, conflating the two mechanisms).
+            self.last_gradient_deflection_magnitude = float(np.linalg.norm(deflection))
         else:
             a_deflected = a
 

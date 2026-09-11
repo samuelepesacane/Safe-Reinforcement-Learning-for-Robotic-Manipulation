@@ -420,8 +420,30 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         else:
             info.setdefault("shield_intervened", False)
 
+        # Total action change from the original proposed action, across every
+        # mechanism the shield applied this step (gradient deflection AND any
+        # bisection fallback, for RiemannianShield; the single bisection
+        # projection for GenericKeepoutShield).
         info["shield_deflection_magnitude"] = float(
             getattr(self.shield, "last_deflection_magnitude", 0.0)
+        )
+
+        # Gradient-stage-only magnitude and whether its norm clip fired this
+        # step, present only for shields with a gradient stage (RiemannianShield).
+        # Kept separate from shield_deflection_magnitude above: conflating the
+        # two was a bug found in review -- the gradient stage alone is bounded
+        # by alpha*max_action_norm, but the total can be larger once the
+        # bisection fallback also fires, and averaging them together made
+        # "deflection magnitude" not actually measure the gradient mechanism
+        # the Riemannian shield is supposed to be characterized by.
+        info["shield_gradient_deflection_magnitude"] = float(
+            getattr(self.shield, "last_gradient_deflection_magnitude", 0.0)
+        )
+        info["shield_gradient_clip_fired"] = bool(
+            getattr(self.shield, "last_gradient_clip_fired", False)
+        )
+        info["shield_gradient_intervened"] = bool(
+            getattr(self.shield, "last_gradient_intervened", False)
         )
 
         return obs, reward, terminated, truncated, info

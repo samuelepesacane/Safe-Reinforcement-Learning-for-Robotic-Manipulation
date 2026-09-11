@@ -15,7 +15,13 @@ class TrainLoggingCallback(BaseCallback):
        rate and deflection magnitude), accumulated from infos at every step and
        averaged over the logging window. Intervention rate and deflection
        magnitude are logged together because the rate alone can't distinguish
-       "intervenes often but gently" from "intervenes rarely but hard".
+       "intervenes often but gently" from "intervenes rarely but hard". For
+       RiemannianShield, the gradient-stage-only magnitude, intervention rate,
+       and (conditional) clip-fire rate are logged separately from the total
+       deflection magnitude, which also includes any bisection fallback --
+       averaging the two together previously hid that the gradient stage is
+       bounded by alpha*max_action_norm and its norm clip can saturate on
+       nearly every intervention.
 
     Averaging over the window ensures that PPO, SAC, RCPO, and LagPPO all produce
     comparable cost and return curves regardless of whether a Lagrangian callback
@@ -49,6 +55,9 @@ class TrainLoggingCallback(BaseCallback):
         self._ep_costs: List[float] = []
         self._ep_interventions: List[int] = []
         self._ep_deflections: List[float] = []
+        self._ep_gradient_deflections: List[float] = []
+        self._ep_gradient_interventions: List[int] = []
+        self._ep_gradient_clip_fired: List[int] = []
         self._step_costs: List[float] = []
 
     def _on_step(self) -> bool:
@@ -75,7 +84,26 @@ class TrainLoggingCallback(BaseCallback):
             # rate: the rate alone can't distinguish "intervenes often but
             # gently" from "intervenes rarely but hard", which matters for
             # comparing a holonomic point robot against a nonholonomic car.
+            # This is the TOTAL action change (gradient stage + any bisection
+            # fallback for RiemannianShield); see the gradient-only fields
+            # below for the mechanism this shield is actually characterized by.
             self._ep_deflections.append(float(info.get("shield_deflection_magnitude", 0.0)))
+
+            # Gradient-stage-only diagnostics (RiemannianShield only; absent
+            # keys default to 0/False for shields with no gradient stage).
+            # Kept separate from the total above because conflating them hid
+            # that the gradient-stage magnitude is bounded by
+            # alpha*max_action_norm and the norm clip may saturate almost
+            # every intervention -- see shield_gradient_clip_fire_rate.
+            self._ep_gradient_deflections.append(
+                float(info.get("shield_gradient_deflection_magnitude", 0.0))
+            )
+            gradient_intervened = bool(info.get("shield_gradient_intervened", False))
+            self._ep_gradient_interventions.append(1 if gradient_intervened else 0)
+            if gradient_intervened:
+                self._ep_gradient_clip_fired.append(
+                    1 if info.get("shield_gradient_clip_fired", False) else 0
+                )
 
             # Episode-level stats are only available when an episode ends
             ep_info = info.get("episode", None)
@@ -116,6 +144,22 @@ class TrainLoggingCallback(BaseCallback):
                     np.mean(self._ep_deflections)
                 )
 
+            if self._ep_gradient_deflections:
+                metrics["train/shield_gradient_deflection_magnitude"] = float(
+                    np.mean(self._ep_gradient_deflections)
+                )
+            if self._ep_gradient_interventions:
+                metrics["train/shield_gradient_intervention_rate"] = float(
+                    np.mean(self._ep_gradient_interventions)
+                )
+            if self._ep_gradient_clip_fired:
+                # Conditional on a gradient intervention having happened this
+                # step (see the accumulation above), not diluted by steps with
+                # no gradient intervention at all.
+                metrics["train/shield_gradient_clip_fire_rate"] = float(
+                    np.mean(self._ep_gradient_clip_fired)
+                )
+
             if metrics and self.custom_logger is not None:
                 try:
                     self.custom_logger.log_scalars(metrics, step=self.num_timesteps)
@@ -128,6 +172,9 @@ class TrainLoggingCallback(BaseCallback):
             self._ep_costs.clear()
             self._ep_interventions.clear()
             self._ep_deflections.clear()
+            self._ep_gradient_deflections.clear()
+            self._ep_gradient_interventions.clear()
+            self._ep_gradient_clip_fired.clear()
             self._step_costs.clear()
 
         return True

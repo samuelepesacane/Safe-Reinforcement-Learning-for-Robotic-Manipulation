@@ -104,7 +104,62 @@ class TestRiemannianShieldDeflection(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(deflection)), 0.1, places=4)
 
         self.assertTrue(shield.last_intervened)
+
+        # No bisection fallback triggers here (the deflected next position is
+        # still well outside the hazard), so total deflection should equal the
+        # gradient-stage deflection exactly -- and the gradient's raw norm
+        # (~150) is far above max_action_norm=1.0, so the clip must have fired.
+        self.assertTrue(shield.last_gradient_intervened)
+        self.assertTrue(shield.last_gradient_clip_fired)
+        self.assertAlmostEqual(shield.last_gradient_deflection_magnitude, 0.1, places=4)
         self.assertAlmostEqual(shield.last_deflection_magnitude, 0.1, places=4)
+        self.assertAlmostEqual(
+            shield.last_deflection_magnitude,
+            shield.last_gradient_deflection_magnitude,
+            places=6,
+        )
+
+    def test_clip_fires_even_at_the_weakest_edge_of_the_influence_zone(self) -> None:
+        """
+        Pins a finding from review: with max_action_norm=1.0, the raw gradient
+        magnitude is |grad| = 2/clearance^3 (the 1/d factor in the code cancels
+        against |diff|=d exactly). At clearance == influence_radius -- the
+        weakest possible interaction, right at the outer edge of the zone --
+        |grad| = 2/influence_radius^3, which for any influence_radius < ~1.26
+        already exceeds max_action_norm=1.0. So the norm clip is expected to
+        fire for EVERY position inside the influence zone, not just close ones,
+        given the influence_radius values actually used in this project
+        (0.2-0.5). That means the gradient deflection is fixed-magnitude
+        (alpha * max_action_norm) whenever it fires at all, not proximity-
+        proportional -- see SESSION_HANDOFF.md for the consequence for the
+        shield's docstrings.
+        """
+        influence_radius = 0.4
+        hazard_radius = 0.2
+        # Just inside the zone, not exactly at the boundary: at clearance ==
+        # influence_radius exactly, float32 round-off can push the computed
+        # clearance a hair above influence_radius and trip the code's own
+        # (correct) "clearance > influence_radius -> skip" boundary check.
+        clearance = influence_radius * 0.999
+        hazard = (0.0, 0.0, hazard_radius)
+        pos = np.array([hazard_radius + clearance, 0.0], dtype=np.float32)
+
+        shield = RiemannianShield(
+            hazards=[hazard],
+            dt=1.0,
+            max_action_norm=1.0,
+            alpha=0.1,
+            influence_radius=influence_radius,
+        )
+
+        raw_grad = shield._barrier_gradient(pos)
+        expected_raw_norm = 2.0 / (clearance ** 3)
+        self.assertAlmostEqual(float(np.linalg.norm(raw_grad)), expected_raw_norm, places=2)
+        self.assertGreater(float(np.linalg.norm(raw_grad)), shield.max_action_norm)
+
+        action = np.zeros(2, dtype=np.float32)
+        shield.step(action, {"agent_pos": pos})
+        self.assertTrue(shield.last_gradient_clip_fired)
 
 
 class TestShieldEnvIntegration(unittest.TestCase):
