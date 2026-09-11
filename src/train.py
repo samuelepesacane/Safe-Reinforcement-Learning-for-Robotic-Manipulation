@@ -21,7 +21,7 @@ import torch
 import multiprocessing as mp
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from .utils.logging import Logger
-from .envs.make_env import make_env
+from .envs.make_env import make_env, refresh_shield_hazards
 from .algos.ppo_sb3 import make_ppo
 from .algos.sac_sb3 import make_sac
 from .algos.lagppo import make_lagppo, LagrangianState
@@ -233,37 +233,12 @@ def build_shield_factory(
                 max_action_norm=max_norm
             )
 
-        # Safety-Gymnasium exposes hazard geometry through different attribute paths
-        # depending on the version. We try each path in order of preference.
-        try:
-            uw = env.unwrapped
-
-            hazards_pos = None
-            hazards_size = 0.2  # default radius for point tasks in Safety-Gymnasium
-
-            if hasattr(uw, "task") and hasattr(uw.task, "hazards"):
-                h = uw.task.hazards
-                hazards_pos = getattr(h, "pos", None)
-                hazards_size = float(getattr(h, "size", 0.2))
-            elif hasattr(uw, "task") and hasattr(uw.task, "hazards_pos"):
-                # Older Safety-Gymnasium layout where pos lives directly on task
-                hazards_pos = uw.task.hazards_pos
-                hazards_size = float(getattr(uw.task, "hazards_size", 0.2))
-            elif hasattr(uw, "world") and hasattr(uw.world, "hazards_pos"):
-                # Legacy Safety-Gym (pre-0.4) attribute path
-                hazards_pos = uw.world.hazards_pos
-                hazards_size = float(getattr(uw.world, "hazards_size", 0.2))
-
-            if hazards_pos is not None and len(hazards_pos) > 0:
-                # Hazard positions are 3D (x, y, z); the shield only needs x, y
-                hz = [(float(p[0]), float(p[1]), hazards_size) for p in hazards_pos]
-                shield.set_hazards(hz)
-                print(f"[Shield] loaded {len(hz)} hazards: {hz}")
-            else:
-                print("[Shield] WARNING: could not find hazard positions, shield is pass-through")
-
-        except Exception as e:
-            print(f"[Shield] WARNING: hazard introspection failed: {e}")
+        # Load hazards for episode 0. ShieldingActionWrapper.reset() calls the
+        # same helper again on every subsequent reset, since Safety-Gymnasium
+        # re-randomizes the hazard layout per episode (this was D2 -- without
+        # the per-reset refresh, the shield keeps checking the episode-0
+        # layout for the rest of training).
+        refresh_shield_hazards(env, shield)
 
         return shield
 

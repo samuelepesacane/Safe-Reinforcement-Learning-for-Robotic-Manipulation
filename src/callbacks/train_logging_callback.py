@@ -11,8 +11,11 @@ class TrainLoggingCallback(BaseCallback):
 
     1. SB3 train/* stats (loss, entropy, KL divergence, etc.), read from SB3's
        internal logger and forwarded as-is.
-    2. Episode-level metrics (return, cost, violation rate, shield interventions),
-       accumulated from infos at every step and averaged over the logging window.
+    2. Episode-level metrics (return, cost, violation rate, shield intervention
+       rate and deflection magnitude), accumulated from infos at every step and
+       averaged over the logging window. Intervention rate and deflection
+       magnitude are logged together because the rate alone can't distinguish
+       "intervenes often but gently" from "intervenes rarely but hard".
 
     Averaging over the window ensures that PPO, SAC, RCPO, and LagPPO all produce
     comparable cost and return curves regardless of whether a Lagrangian callback
@@ -45,6 +48,7 @@ class TrainLoggingCallback(BaseCallback):
         self._ep_returns: List[float] = []
         self._ep_costs: List[float] = []
         self._ep_interventions: List[int] = []
+        self._ep_deflections: List[float] = []
         self._step_costs: List[float] = []
 
     def _on_step(self) -> bool:
@@ -66,6 +70,12 @@ class TrainLoggingCallback(BaseCallback):
 
             # Track per-step shield interventions so we can compute a rate
             self._ep_interventions.append(1 if info.get("shield_intervened", False) else 0)
+
+            # Track per-step deflection magnitude alongside the intervention
+            # rate: the rate alone can't distinguish "intervenes often but
+            # gently" from "intervenes rarely but hard", which matters for
+            # comparing a holonomic point robot against a nonholonomic car.
+            self._ep_deflections.append(float(info.get("shield_deflection_magnitude", 0.0)))
 
             # Episode-level stats are only available when an episode ends
             ep_info = info.get("episode", None)
@@ -101,6 +111,11 @@ class TrainLoggingCallback(BaseCallback):
                     np.mean(self._ep_interventions)
                 )
 
+            if self._ep_deflections:
+                metrics["train/shield_deflection_magnitude"] = float(
+                    np.mean(self._ep_deflections)
+                )
+
             if metrics and self.custom_logger is not None:
                 try:
                     self.custom_logger.log_scalars(metrics, step=self.num_timesteps)
@@ -112,6 +127,7 @@ class TrainLoggingCallback(BaseCallback):
             self._ep_returns.clear()
             self._ep_costs.clear()
             self._ep_interventions.clear()
+            self._ep_deflections.clear()
             self._step_costs.clear()
 
         return True

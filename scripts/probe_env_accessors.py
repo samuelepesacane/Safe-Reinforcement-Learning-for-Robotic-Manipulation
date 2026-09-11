@@ -161,13 +161,22 @@ def main() -> None:
     if not haz_hits:
         print("  (none)")
 
+    # Safety-Gymnasium's raw step() returns a 6-tuple
+    # (obs, reward, cost, terminated, truncated, info), which crashes
+    # gym.make()'s automatic TimeLimit wrapper (it expects 5). Step the
+    # unwrapped env directly to sidestep that -- episode-length bookkeeping
+    # doesn't matter for this short motion probe.
+    def step_env(action: np.ndarray) -> np.ndarray:
+        out = uw.step(action)
+        return out[0]
+
     # Check 1: does a position accessor actually track the robot?
     print("\n--- check 1: position tracks motion " + "-" * 34)
     moving: List[Tuple[str, float]] = []
     for path in pos_hits:
         before = np.asarray(try_paths(uw, [path])[path], dtype=float).ravel()[:2].copy()
         for _ in range(args.steps):
-            env.step(np.ones(env.action_space.shape, dtype=np.float32))
+            step_env(np.ones(env.action_space.shape, dtype=np.float32))
         after = np.asarray(try_paths(uw, [path])[path], dtype=float).ravel()[:2]
         travelled = float(np.linalg.norm(after - before))
         status = "MOVES" if travelled > 1e-3 else "static"
@@ -180,7 +189,7 @@ def main() -> None:
     obs2, _ = env.reset(seed=0)
     obs_before = np.asarray(obs2, dtype=float)[:2].copy()
     for _ in range(args.steps):
-        obs2, *_ = env.step(np.ones(env.action_space.shape, dtype=np.float32))
+        obs2 = step_env(np.ones(env.action_space.shape, dtype=np.float32))
     obs_after = np.asarray(obs2, dtype=float)[:2]
     if moving:
         ref_path = moving[0][0]
@@ -238,3 +247,7 @@ def main() -> None:
     if not (ok_pos and ok_yaw):
         print("\nRun 0 and Run 3 are BLOCKED until position and heading both PASS.")
         print("Paste this whole output back and the candidate path lists will be widened.")
+
+
+if __name__ == "__main__":
+    main()

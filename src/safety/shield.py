@@ -22,10 +22,10 @@ class GenericKeepoutShield:
     - Otherwise, return the original action unchanged.
 
     This is a purely geometric shield. It improves safety locally but does not
-    provide formal guarantees in all scenarios. If the agent's position cannot
-    be inferred from the observation, the shield acts as a pass-through.
-    For 3D tasks such as Fetch manipulation, it also degenerates to a
-    pass-through since the 2D projection is not meaningful.
+    provide formal guarantees in all scenarios. The agent's position must be
+    supplied by the caller (see _extract_agent_xy) -- it is not recoverable
+    from Safety-Gymnasium's flat sensor+lidar observation, so a caller that
+    fails to resolve it gets a loud error rather than a silent pass-through.
     """
 
     def __init__(
@@ -62,6 +62,7 @@ class GenericKeepoutShield:
         # Diagnostics: readable by the environment wrapper to log intervention stats
         self.last_intervened: bool = False
         self.interventions_in_episode: int = 0
+        self.last_deflection_magnitude: float = 0.0
 
     def set_hazards(self, hazards: List[Tuple[float, float, float]]) -> None:
         """
@@ -90,39 +91,49 @@ class GenericKeepoutShield:
         """
         self.interventions_in_episode = 0
         self.last_intervened = False
+        self.last_deflection_magnitude = 0.0
 
-    def _extract_agent_xy(self, obs: Any) -> Optional[np.ndarray]:
+    def _extract_agent_xy(self, obs: Any) -> np.ndarray:
         """
         Extract the agent's 2D position from an observation.
 
-        Supports the observation layouts used in Safety-Gymnasium and
-        Gymnasium-Robotics: dict observations with "agent_pos" or
-        "achieved_goal", and flat numpy arrays where XY are at indices 0:2
-        (the layout used by SafetyPointPush1-v0).
+        Supports dict observations with "agent_pos" or "achieved_goal" keys.
+        There is deliberately no flat-array fallback: Safety-Gymnasium's flat
+        observation vector is proprioceptive sensors plus pseudo-lidar and
+        contains no absolute position at all, so obs[:2] there is the first
+        two accelerometer components, not a position (this was D1 -- the
+        shield silently read accelerometer noise as XY for every reported
+        run). The real position has to come from the environment
+        (env.unwrapped), which is the caller's job: ShieldingActionWrapper
+        resolves it at step time and packages it as {"agent_pos": ...}
+        before calling into the shield.
 
-        Returns None if the position cannot be reliably extracted, which
-        causes the shield to act as a pass-through for that step.
+        Raises if the position cannot be extracted, rather than returning
+        None, so a broken wiring fails loudly instead of silently degrading
+        every shielded run to a pass-through (the second half of D1).
 
-        :param obs: Environment observation at the current time step.
+        :param obs: Environment observation at the current time step, expected
+            to be a dict carrying "agent_pos" or "achieved_goal".
             :type obs: Any
 
-        :return: 2D position [x, y], or None if extraction fails.
-            :rtype: Optional[np.ndarray]
-        """
-        if obs is None:
-            return None
+        :return: 2D position [x, y].
+            :rtype: np.ndarray
 
+        :raises ValueError: If obs is not a dict carrying a usable position key.
+        """
         if isinstance(obs, dict):
             if "agent_pos" in obs:
                 return np.array(obs["agent_pos"][:2], dtype=np.float32)
             if "achieved_goal" in obs:
                 return np.array(obs["achieved_goal"][:2], dtype=np.float32)
 
-        # Flat array: SafetyPointPush1-v0 puts agent XY at indices 0:2
-        if isinstance(obs, np.ndarray) and obs.shape[0] >= 2:
-            return np.array(obs[:2], dtype=np.float32)
-
-        return None
+        raise ValueError(
+            "Could not extract agent position: expected a dict obs with an "
+            f"'agent_pos' or 'achieved_goal' key, got {type(obs).__name__}. "
+            "The shield needs a real position from env.unwrapped, supplied by "
+            "the caller -- it cannot be recovered from Safety-Gymnasium's flat "
+            "sensor+lidar observation."
+        )
 
     def step(self, action: np.ndarray, obs: Any) -> np.ndarray:
         """
@@ -137,23 +148,25 @@ class GenericKeepoutShield:
             are interpreted as XY velocity components.
             :type action: np.ndarray
         :param obs: Current environment observation, used to extract the
-            agent's XY position. If the position cannot be extracted, the
-            action is returned unchanged.
+            agent's XY position. Must carry a real position (see
+            _extract_agent_xy); this raises rather than passing the action
+            through unchanged if it does not.
             :type obs: Any
 
         :return: Safe action after optional scaling. Returns the original
-            action if no intervention is needed or if position is unavailable.
+            action if no intervention is needed.
             :rtype: np.ndarray
         """
         self.last_intervened = False
+        self.last_deflection_magnitude = 0.0
 
-        # No hazards configured: nothing to check
+        # No hazards configured: nothing to check. This is the only
+        # legitimate pass-through path -- position extraction below always
+        # either succeeds or raises.
         if not self.hazards:
             return action
 
         pos = self._extract_agent_xy(obs)
-        if pos is None:
-            return action
 
         a = np.array(action, dtype=np.float32)
         if a.shape[0] < 2:
@@ -193,6 +206,7 @@ class GenericKeepoutShield:
             a_proj[:2] = a_xy * scale
             self.last_intervened = True
             self.interventions_in_episode += 1
+            self.last_deflection_magnitude = float(np.linalg.norm(a_proj[:2] - a[:2]))
             return a_proj
 
         return action

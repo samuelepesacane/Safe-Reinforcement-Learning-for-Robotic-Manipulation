@@ -1,4 +1,4 @@
-from typing import Callable, Optional, Any, Dict, Tuple
+from typing import Callable, List, Optional, Any, Dict, Tuple
 import gymnasium as gym
 import numpy as np
 from gymnasium.wrappers.time_limit import TimeLimit
@@ -207,16 +207,137 @@ class RewardShapingWrapper(gym.RewardWrapper):
         return obs, shaped, terminated, truncated, info
 
 
+def resolve_agent_pos(env: gym.Env) -> np.ndarray:
+    """
+    Resolve the agent's true 2D position from the environment.
+
+    Safety-Gymnasium's flat observation vector (sensors + pseudo-lidar) has no
+    absolute position in it -- obs[:2] there is the first two accelerometer
+    components, not a position (this was D1). The real position lives on
+    env.unwrapped, verified empirically against SafetyPointGoal1-v0 and
+    SafetyCarGoal1-v0 via scripts/probe_env_accessors.py: the primary path is
+    the same env.unwrapped.task.agent object whose .pos attribute the probe
+    confirmed tracks the robot (not merely exists) on both robot types.
+
+    Raises rather than returning None on failure, so a broken accessor fails
+    loudly instead of silently degrading the shield to a pass-through.
+
+    :param env: The (possibly wrapped) environment; env.unwrapped is used.
+        :type env: gym.Env
+
+    :return: 2D position [x, y].
+        :rtype: np.ndarray
+
+    :raises RuntimeError: If no known accessor path yields a position.
+    """
+    uw = env.unwrapped
+
+    try:
+        if hasattr(uw, "task") and hasattr(uw.task, "agent"):
+            pos = getattr(uw.task.agent, "pos", None)
+            if pos is not None:
+                return np.array(pos[:2], dtype=np.float32)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not resolve agent position from env.unwrapped: expected "
+        "env.unwrapped.task.agent.pos (verified via scripts/probe_env_accessors.py "
+        "on SafetyPointGoal1-v0 and SafetyCarGoal1-v0). If this fires on a "
+        "different env, widen the probe's POSITION_PATHS and this cascade "
+        "together -- do not silently pass the action through unshielded."
+    )
+
+
+def resolve_hazards(env: gym.Env) -> Optional[List[Tuple[float, float, float]]]:
+    """
+    Introspect hazard geometry (center + radius) from the environment.
+
+    Safety-Gymnasium exposes hazard geometry through different attribute
+    paths depending on version. We try each path in order of preference, and
+    return None (never raise) on failure, since a shield with no hazards is a
+    legitimate, if inert, configuration -- unlike a failed position lookup,
+    which corrupts every subsequent check.
+
+    Must be called every episode, not just once at shield construction:
+    Safety-Gymnasium re-randomizes the hazard layout on every reset, and a
+    shield holding the episode-0 layout checks the wrong geometry for
+    ~999 of every 1000 steps at typical episode lengths (this was D2).
+
+    :param env: The (possibly wrapped) environment; env.unwrapped is used.
+        :type env: gym.Env
+
+    :return: List of (x, y, radius) hazard discs, or None if none were found.
+        :rtype: Optional[List[Tuple[float, float, float]]]
+    """
+    try:
+        uw = env.unwrapped
+
+        hazards_pos = None
+        hazards_size = 0.2  # default radius for point tasks in Safety-Gymnasium
+
+        if hasattr(uw, "task") and hasattr(uw.task, "hazards"):
+            h = uw.task.hazards
+            hazards_pos = getattr(h, "pos", None)
+            hazards_size = float(getattr(h, "size", 0.2))
+        elif hasattr(uw, "task") and hasattr(uw.task, "hazards_pos"):
+            # Older Safety-Gymnasium layout where pos lives directly on task
+            hazards_pos = uw.task.hazards_pos
+            hazards_size = float(getattr(uw.task, "hazards_size", 0.2))
+        elif hasattr(uw, "world") and hasattr(uw.world, "hazards_pos"):
+            # Legacy Safety-Gym (pre-0.4) attribute path
+            hazards_pos = uw.world.hazards_pos
+            hazards_size = float(getattr(uw.world, "hazards_size", 0.2))
+
+        if hazards_pos is not None and len(hazards_pos) > 0:
+            # Hazard positions are 3D (x, y, z); the shield only needs x, y
+            return [(float(p[0]), float(p[1]), hazards_size) for p in hazards_pos]
+
+    except Exception as e:
+        print(f"[Shield] WARNING: hazard introspection failed: {e}")
+
+    return None
+
+
+def refresh_shield_hazards(env: gym.Env, shield: Any) -> None:
+    """
+    Re-resolve hazards from env and push them into shield.
+
+    Thin wrapper around resolve_hazards that logs the outcome the same way
+    at every call site (construction and every reset), so the two are never
+    allowed to drift into printing different messages for the same failure.
+
+    :param env: The (possibly wrapped) environment.
+        :type env: gym.Env
+    :param shield: Shield object exposing set_hazards(list).
+        :type shield: Any
+
+    :return: None.
+        :rtype: None
+    """
+    hz = resolve_hazards(env)
+    if hz:
+        shield.set_hazards(hz)
+        print(f"[Shield] loaded {len(hz)} hazards: {hz}")
+    else:
+        print("[Shield] WARNING: could not find hazard positions, shield is pass-through")
+
+
 class ShieldingActionWrapper(gym.ActionWrapper):
     """
     Project actions through a safety shield before passing them to the env.
 
     The shield is any object that implements:
 
-        safe_action = shield.step(action, obs)
+        safe_action = shield.step(action, {"agent_pos": xy})
 
-    The wrapper replaces the original action with safe_action, then logs
-    whether the shield intervened via info["shield_intervened"]. It also
+    The wrapper resolves the agent's real position from env.unwrapped at
+    every step (see resolve_agent_pos) rather than from the raw observation,
+    and refreshes hazard geometry from env.unwrapped on every reset (see
+    refresh_shield_hazards), since Safety-Gymnasium re-randomizes hazards
+    per episode. It replaces the original action with safe_action, then logs
+    whether the shield intervened and by how much via
+    info["shield_intervened"] / info["shield_deflection_magnitude"]. It also
     normalizes the step output so info["cost"] is always present, mirroring
     the behavior of CostInfoWrapper and RewardShapingWrapper.
     """
@@ -273,9 +394,11 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         """
         Apply the safety shield to the proposed action, then step the env.
 
-        The most recent observation is passed to the shield so it can make a
-        geometry-aware decision. After stepping, last_obs is updated and the
-        shield's intervention flag is surfaced in info.
+        The agent's real position is resolved from env.unwrapped at step
+        time (not read from the raw observation -- see resolve_agent_pos and
+        D1) and packaged the way the shield expects. After stepping, last_obs
+        is updated and the shield's intervention flag and deflection
+        magnitude are surfaced in info.
 
         :param action: Proposed action from the policy.
             :type action: Any
@@ -285,7 +408,8 @@ class ShieldingActionWrapper(gym.ActionWrapper):
             modified the original action.
             :rtype: Tuple[Any, float, bool, bool, Dict[str, Any]]
         """
-        safe_action = self.shield.step(action, self._last_obs)
+        agent_pos = resolve_agent_pos(self.env)
+        safe_action = self.shield.step(action, {"agent_pos": agent_pos})
         obs, reward, terminated, truncated, info = self.step_with_cost(safe_action)
         self._last_obs = obs
 
@@ -296,6 +420,10 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         else:
             info.setdefault("shield_intervened", False)
 
+        info["shield_deflection_magnitude"] = float(
+            getattr(self.shield, "last_deflection_magnitude", 0.0)
+        )
+
         return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs) -> Tuple[Any, Dict[str, Any]]:
@@ -303,7 +431,10 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         Reset the environment and the shield's internal state.
 
         Stores the initial observation so the first call to step() has a
-        valid obs to pass to the shield.
+        valid obs to pass to the shield. Also re-resolves hazard geometry
+        from the freshly-reset environment: Safety-Gymnasium re-randomizes
+        hazards on every reset, so without this the shield would keep
+        checking the episode-0 layout for the rest of training (D2).
 
         :param kwargs: Keyword arguments forwarded to the wrapped env's reset.
             :type kwargs: dict
@@ -316,6 +447,8 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         # Reset shield episode state (clears intervention counters, etc.)
         if hasattr(self.shield, "on_reset"):
             self.shield.on_reset()
+        if hasattr(self.shield, "set_hazards"):
+            refresh_shield_hazards(self.env, self.shield)
         return obs, info
 
 
