@@ -420,6 +420,19 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         else:
             info.setdefault("shield_intervened", False)
 
+        # Position before this step and the XY action actually executed
+        # (post-shield, whether or not it intervened). Together with the
+        # resolved position on the NEXT step, this is what lets an external
+        # caller test the shield's own kinematic assumption
+        # (next_pos = pos + dt*a_xy) against the real environment dynamics --
+        # e.g. to check whether that assumption holds for a nonholonomic
+        # robot the way it does for a holonomic one. Not used internally;
+        # exposed purely as instrumentation.
+        info["shield_agent_pos"] = np.asarray(agent_pos, dtype=np.float32).copy()
+        info["shield_safe_action_xy"] = np.asarray(
+            safe_action[:2], dtype=np.float32
+        ).copy()
+
         # Total action change from the original proposed action, across every
         # mechanism the shield applied this step (gradient deflection AND any
         # bisection fallback, for RiemannianShield; the single bisection
