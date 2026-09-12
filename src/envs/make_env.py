@@ -249,6 +249,40 @@ def resolve_agent_pos(env: gym.Env) -> np.ndarray:
     )
 
 
+def resolve_heading(env: gym.Env) -> Optional[float]:
+    """
+    Resolve the agent's current yaw (heading), in radians, from env.unwrapped.
+
+    Uses env.unwrapped.task.agent.mat (a 3x3 rotation matrix), the same
+    accessor confirmed by scripts/probe_env_accessors.py on both
+    SafetyPointGoal1-v0 and SafetyCarGoal1-v0: yaw = atan2(mat[1,0], mat[0,0]).
+
+    Unlike resolve_agent_pos, this returns None rather than raising on
+    failure: heading is only needed by the "heading_fit" kinematic model
+    (opt-in, see shield.py) and by escape-dynamics instrumentation, both of
+    which are not on the default path. A caller that actually needs heading
+    (RiemannianShield/GenericKeepoutShield in "heading_fit" mode) raises its
+    own loud error if it receives None -- see
+    GenericKeepoutShield._predict_displacement.
+
+    :param env: The (possibly wrapped) environment; env.unwrapped is used.
+        :type env: gym.Env
+
+    :return: Yaw in radians, or None if the accessor is unavailable.
+        :rtype: Optional[float]
+    """
+    uw = env.unwrapped
+    try:
+        if hasattr(uw, "task") and hasattr(uw.task, "agent"):
+            mat = getattr(uw.task.agent, "mat", None)
+            if mat is not None:
+                m = np.asarray(mat, dtype=np.float64).reshape(3, 3)
+                return float(np.arctan2(m[1, 0], m[0, 0]))
+    except Exception:
+        pass
+    return None
+
+
 def resolve_hazards(env: gym.Env) -> Optional[List[Tuple[float, float, float]]]:
     """
     Introspect hazard geometry (center + radius) from the environment.
@@ -409,7 +443,12 @@ class ShieldingActionWrapper(gym.ActionWrapper):
             :rtype: Tuple[Any, float, bool, bool, Dict[str, Any]]
         """
         agent_pos = resolve_agent_pos(self.env)
-        safe_action = self.shield.step(action, {"agent_pos": agent_pos})
+        # Resolved unconditionally (cheap) so both the "heading_fit"
+        # kinematic model and any external instrumentation (e.g. the
+        # escape-dynamics probe) can rely on it; a shield in the default
+        # "world_xy" mode simply ignores it (see _extract_heading).
+        heading = resolve_heading(self.env)
+        safe_action = self.shield.step(action, {"agent_pos": agent_pos, "heading": heading})
         obs, reward, terminated, truncated, info = self.step_with_cost(safe_action)
         self._last_obs = obs
 
@@ -432,6 +471,12 @@ class ShieldingActionWrapper(gym.ActionWrapper):
         info["shield_safe_action_xy"] = np.asarray(
             safe_action[:2], dtype=np.float32
         ).copy()
+        # Heading at the moment the action was decided (radians, or None if
+        # unresolvable on this env). Exposed for the same reason as the two
+        # fields above: it lets an external caller test the shield's
+        # kinematic assumption, and separately lets escape-dynamics
+        # instrumentation relate velocity direction to heading.
+        info["shield_heading"] = heading
 
         # Total action change from the original proposed action, across every
         # mechanism the shield applied this step (gradient deflection AND any

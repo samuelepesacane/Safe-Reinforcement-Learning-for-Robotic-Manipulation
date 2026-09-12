@@ -112,6 +112,21 @@ def parse_args() -> argparse.Namespace:
         help="Influence radius (beyond hazard boundary) for the Riemannian shield.",
     )
     ap.add_argument(
+        "--shield_kinematic_model",
+        type=str,
+        default="world_xy",
+        choices=["world_xy", "heading_fit"],
+        help=(
+            "Which next-position prediction the shield uses. Default "
+            "'world_xy' is the original, unchanged assumption (pos_next = "
+            "pos + dt*a_xy), measured to have near-zero direction cosine "
+            "with true displacement on both robots (SESSION_HANDOFF.md). "
+            "'heading_fit' uses the data-fit heading-relative model in "
+            "src/safety/kinematic_fits.py -- requires a registered fit for "
+            "--env_id (currently SafetyCarGoal1-v0, SafetyPointGoal1-v0)."
+        ),
+    )
+    ap.add_argument(
         "--use_preferences",
         action="store_true",
         help="Use a learned preference-based reward model instead of env reward.",
@@ -171,6 +186,7 @@ def build_shield_factory(
     shield_type: str = "geometric",
     alpha: float = 0.1,
     influence_radius: float = 0.5,
+    kinematic_model: str = "world_xy",
 ) -> Callable[[Any], GenericKeepoutShield]:
     """
     Build a factory that constructs a keepout shield for a given env.
@@ -200,6 +216,10 @@ def build_shield_factory(
     :param influence_radius: Influence radius beyond hazard boundary for the
         Riemannian shield.
         :type influence_radius: float
+    :param kinematic_model: "world_xy" (default, unchanged) or "heading_fit"
+        (see shield.py's GenericKeepoutShield docstring and
+        src/safety/kinematic_fits.py). Ignored for the mujoco: path.
+        :type kinematic_model: str
 
     :return: A callable that maps an environment instance to a configured shield.
         :rtype: Callable[[Any], GenericKeepoutShield]
@@ -213,6 +233,11 @@ def build_shield_factory(
     if shield_type == "riemannian":
         from .safety.riemannian_shield import RiemannianShield
 
+    body_frame_M, body_frame_b = (None, None)
+    if kinematic_model == "heading_fit":
+        from .safety.kinematic_fits import get_body_frame_fit
+        body_frame_M, body_frame_b = get_body_frame_fit(env_id)
+
     def factory(env: Any) -> GenericKeepoutShield:
         max_norm = float(np.max(env.action_space.high))
 
@@ -224,13 +249,19 @@ def build_shield_factory(
                 dt=0.1,
                 max_action_norm=max_norm,
                 alpha=alpha,
-                influence_radius=influence_radius
+                influence_radius=influence_radius,
+                kinematic_model=kinematic_model,
+                body_frame_M=body_frame_M,
+                body_frame_b=body_frame_b,
             )
         else:
             shield = GenericKeepoutShield(
                 hazards=[],
                 dt=0.1,
-                max_action_norm=max_norm
+                max_action_norm=max_norm,
+                kinematic_model=kinematic_model,
+                body_frame_M=body_frame_M,
+                body_frame_b=body_frame_b,
             )
 
         # Load hazards for episode 0. ShieldingActionWrapper.reset() calls the
@@ -386,7 +417,8 @@ def main():
                         args.env_id,
                         shield_type=args.shield_type,
                         alpha=args.shield_alpha,
-                        influence_radius=args.shield_influence_radius
+                        influence_radius=args.shield_influence_radius,
+                        kinematic_model=args.shield_kinematic_model,
                     )
                     if args.use_shield
                     else None

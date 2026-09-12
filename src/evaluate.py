@@ -109,6 +109,13 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Influence radius for the Riemannian shield. Mirrors train.py.",
     )
+    ap.add_argument(
+        "--shield_kinematic_model",
+        type=str,
+        default="world_xy",
+        choices=["world_xy", "heading_fit"],
+        help="Shield next-position prediction model. Mirrors train.py.",
+    )
     return ap.parse_args()
 
 
@@ -160,6 +167,7 @@ def main():
             shield_type=args.shield_type,
             alpha=args.shield_alpha,
             influence_radius=args.shield_influence_radius,
+            kinematic_model=args.shield_kinematic_model,
         )
         if args.use_shield
         else None

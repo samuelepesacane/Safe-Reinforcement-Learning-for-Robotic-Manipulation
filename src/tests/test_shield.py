@@ -45,6 +45,88 @@ class TestGenericKeepoutShield(unittest.TestCase):
         self.assertGreaterEqual(dist, 1.0 - 1e-3)
         self.assertTrue(shield.last_intervened)
 
+    def test_heading_fit_requires_calibration(self) -> None:
+        """
+        kinematic_model='heading_fit' must raise at construction time if no
+        body_frame_M/body_frame_b is supplied, rather than silently falling
+        back to the known-wrong world_xy assumption.
+        """
+        with self.assertRaises(ValueError):
+            GenericKeepoutShield(hazards=[(0.0, 0.0, 1.0)], kinematic_model="heading_fit")
+
+    def test_heading_fit_requires_heading_at_step_time(self) -> None:
+        """
+        Even with calibration supplied, a step() call whose obs carries no
+        heading must raise rather than silently using body_frame_b alone (or
+        crashing on a None inside the rotation math).
+        """
+        shield = GenericKeepoutShield(
+            hazards=[(0.0, 0.0, 1.0)],
+            kinematic_model="heading_fit",
+            body_frame_M=np.eye(2, dtype=np.float32),
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        with self.assertRaises(ValueError):
+            shield.step(
+                np.array([1.0, 0.0], dtype=np.float32),
+                {"agent_pos": np.array([0.5, 0.0], dtype=np.float32)},
+            )
+
+    def test_heading_fit_rotates_body_frame_prediction_into_world_frame(self) -> None:
+        """
+        Numerically pins the heading_fit math: with M=I, b=0, the predicted
+        displacement is exactly R(heading) @ a_xy, not the world_xy dt*a_xy.
+        A heading of +90 degrees should rotate a forward (+x) action into a
+        world-frame +y displacement -- this is exactly what a fixed
+        world-frame model can never produce regardless of scale, so it is
+        the cleanest possible test that heading is actually being used.
+        """
+        shield = GenericKeepoutShield(
+            hazards=[],  # no hazards: step() returns the raw action, but
+            # _predict_displacement is exercised directly below regardless.
+            kinematic_model="heading_fit",
+            body_frame_M=np.eye(2, dtype=np.float32),
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        a_xy = np.array([1.0, 0.0], dtype=np.float32)
+        heading = np.pi / 2  # facing +y in world frame
+        pred = shield._predict_displacement(a_xy, heading)
+        np.testing.assert_allclose(pred, np.array([0.0, 1.0]), atol=1e-5)
+
+    def test_heading_fit_predicts_and_avoids_hazard_for_a_sideways_robot(self) -> None:
+        """
+        End-to-end check that heading_fit changes shield BEHAVIOR, not just
+        the internal prediction: a robot facing +y (heading=90deg) whose body
+        frame maps action -> (forward, lateral) = a_xy unchanged (M=I) is
+        actually moving in world +y when it commands "forward" (+x action).
+        Under the OLD world_xy model this same action would incorrectly
+        predict movement in world +x, missing a hazard sitting to the north.
+        Under heading_fit it must correctly predict the +y motion and project
+        the action away from a hazard placed there.
+        """
+        hazard = (0.0, 1.0, 0.3)  # sits north of the robot
+        pos = np.array([0.0, 0.0], dtype=np.float32)
+        heading = np.pi / 2  # facing +y (i.e. "forward" is world +y)
+
+        shield_new = GenericKeepoutShield(
+            hazards=[hazard],
+            dt=1.0,
+            max_action_norm=1.0,
+            kinematic_model="heading_fit",
+            body_frame_M=np.eye(2, dtype=np.float32),
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        action = np.array([1.0, 0.0], dtype=np.float32)  # "drive forward"
+        safe_action_new = shield_new.step(action, {"agent_pos": pos, "heading": heading})
+        self.assertTrue(shield_new.last_intervened)
+
+        # Old world_xy model at the same pose: "forward" is misread as world
+        # +x, so it never sees the hazard sitting north and does not intervene.
+        shield_old = GenericKeepoutShield(hazards=[hazard], dt=1.0, max_action_norm=1.0)
+        safe_action_old = shield_old.step(action, {"agent_pos": pos, "heading": heading})
+        self.assertFalse(shield_old.last_intervened)
+        np.testing.assert_allclose(safe_action_old, action)
+
     def test_extract_agent_xy_raises_on_non_dict_obs(self) -> None:
         """
         D1 (second half): a broken position source must raise, not silently

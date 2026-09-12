@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Tuple, Any
 import numpy as np
 
@@ -34,6 +35,9 @@ class GenericKeepoutShield:
         dt: float = 0.1,
         max_action_norm: float = 1.0,
         epsilon: float = 1e-3,
+        kinematic_model: str = "world_xy",
+        body_frame_M: Optional[np.ndarray] = None,
+        body_frame_b: Optional[np.ndarray] = None,
     ) -> None:
         """
         Initialize the keepout shield.
@@ -41,8 +45,9 @@ class GenericKeepoutShield:
         :param hazards: List of hazard discs, each as (x, y, radius). If None,
             the shield starts with no hazards and acts as a pass-through.
             :type hazards: Optional[List[Tuple[float, float, float]]]
-        :param dt: Time step used to predict the next position
-            (pos_next = pos + dt * a_xy).
+        :param dt: Time step used to predict the next position under the
+            default "world_xy" kinematic model
+            (pos_next = pos + dt * a_xy). Unused under "heading_fit".
             :type dt: float
         :param max_action_norm: Maximum allowed L2 norm of the XY action
             component. Actions exceeding this are rescaled before safety checks.
@@ -50,14 +55,58 @@ class GenericKeepoutShield:
         :param epsilon: Safety margin kept between the predicted position and
             the hazard boundary.
             :type epsilon: float
+        :param kinematic_model: Which next-position prediction to use.
+            "world_xy" (default, unchanged behavior) treats the action as a
+            world-frame xy velocity: pos_next = pos + dt * a_xy. Measured
+            against ground truth (SESSION_HANDOFF.md, 2026-09-11), this
+            assumption's direction cosine similarity with the true
+            displacement is statistically indistinguishable from zero on
+            BOTH SafetyPointGoal1-v0 and SafetyCarGoal1-v0 -- a universal
+            defect, not a robot-specific one. "heading_fit" instead predicts
+            pos_next = pos + R(heading) @ (body_frame_M @ a_xy +
+            body_frame_b), a heading-relative (turn-and-drive) model fit
+            from rollout data (see scripts/fit_kinematic_model.py), which on
+            held-out data cuts median prediction error from 43-57% of the
+            hazard radius to 4-6% on both robots. Requires heading to be
+            supplied via obs["heading"] at step time (raises if absent) and
+            requires body_frame_M/body_frame_b to be set.
+            :type kinematic_model: str
+        :param body_frame_M: 2x2 matrix mapping action to body-frame
+            displacement under "heading_fit" (disp_body = M @ a_xy + b).
+            Required when kinematic_model == "heading_fit".
+            :type body_frame_M: Optional[np.ndarray]
+        :param body_frame_b: 2-vector intercept for the body-frame
+            displacement fit. Required when kinematic_model == "heading_fit".
+            :type body_frame_b: Optional[np.ndarray]
 
-        :return: None.
-            :rtype: None
+        :raises ValueError: If kinematic_model is "heading_fit" but
+            body_frame_M or body_frame_b is not supplied, or if
+            kinematic_model is neither "world_xy" nor "heading_fit".
         """
         self.hazards: List[Tuple[float, float, float]] = hazards if hazards is not None else []
         self.dt: float = dt
         self.max_action_norm: float = max_action_norm
         self.epsilon: float = epsilon
+
+        if kinematic_model not in ("world_xy", "heading_fit"):
+            raise ValueError(
+                f"Unknown kinematic_model {kinematic_model!r}; expected "
+                "'world_xy' or 'heading_fit'."
+            )
+        if kinematic_model == "heading_fit" and (body_frame_M is None or body_frame_b is None):
+            raise ValueError(
+                "kinematic_model='heading_fit' requires body_frame_M and "
+                "body_frame_b (fit via scripts/fit_kinematic_model.py) -- "
+                "failing loudly rather than silently falling back to the "
+                "known-wrong world_xy assumption."
+            )
+        self.kinematic_model: str = kinematic_model
+        self.body_frame_M: Optional[np.ndarray] = (
+            np.asarray(body_frame_M, dtype=np.float32) if body_frame_M is not None else None
+        )
+        self.body_frame_b: Optional[np.ndarray] = (
+            np.asarray(body_frame_b, dtype=np.float32) if body_frame_b is not None else None
+        )
 
         # Diagnostics: readable by the environment wrapper to log intervention stats
         self.last_intervened: bool = False
@@ -135,6 +184,70 @@ class GenericKeepoutShield:
             "sensor+lidar observation."
         )
 
+    def _extract_heading(self, obs: Any) -> Optional[float]:
+        """
+        Extract the agent's current heading (yaw, radians) from obs, if present.
+
+        Only required when kinematic_model == "heading_fit". Returns None
+        rather than raising when absent, so callers using the default
+        "world_xy" model (which never needs heading) are unaffected; step()
+        itself raises if heading_fit needs it and it is missing.
+
+        :param obs: Environment observation, expected to be a dict optionally
+            carrying a "heading" key (yaw in radians).
+            :type obs: Any
+
+        :return: Yaw in radians, or None if not present.
+            :rtype: Optional[float]
+        """
+        if isinstance(obs, dict) and "heading" in obs and obs["heading"] is not None:
+            return float(obs["heading"])
+        return None
+
+    def _predict_displacement(self, a_xy: np.ndarray, heading: Optional[float]) -> np.ndarray:
+        """
+        Predict world-frame displacement for a given XY action, under
+        whichever kinematic_model this shield was configured with.
+
+        "world_xy" (default): dt * a_xy, i.e. the action is a world-frame
+        velocity command, independent of heading.
+
+        "heading_fit": R(heading) @ (body_frame_M @ a_xy + body_frame_b), a
+        heading-relative model fit from rollout data. Only the M @ a_xy term
+        is meant to scale with a partially-applied action during the
+        bisection search below; body_frame_b is the residual/drift term
+        measured at the action actually taken and is added unscaled,
+        matching how it was fit (see scripts/fit_kinematic_model.py).
+
+        :param a_xy: XY action component (possibly scaled by a bisection
+            trial factor).
+            :type a_xy: np.ndarray
+        :param heading: Current yaw in radians. Required (non-None) under
+            "heading_fit".
+            :type heading: Optional[float]
+
+        :return: Predicted world-frame displacement, shape (2,).
+            :rtype: np.ndarray
+
+        :raises ValueError: If kinematic_model == "heading_fit" and heading
+            is None.
+        """
+        if self.kinematic_model == "world_xy":
+            return self.dt * a_xy
+
+        if heading is None:
+            raise ValueError(
+                "kinematic_model='heading_fit' requires a heading, but obs "
+                "carried none. The caller must resolve it from env.unwrapped "
+                "(see resolve_heading in make_env.py) and pass it as "
+                "obs['heading'] -- failing loudly rather than silently "
+                "falling back to the known-wrong world_xy assumption."
+            )
+        disp_body = self.body_frame_M @ a_xy + self.body_frame_b
+        c, s = math.cos(heading), math.sin(heading)
+        R = np.array([[c, -s], [s, c]], dtype=np.float32)
+        return R @ disp_body
+
     def step(self, action: np.ndarray, obs: Any) -> np.ndarray:
         """
         Project a proposed action through the geometric keepout shield.
@@ -167,6 +280,7 @@ class GenericKeepoutShield:
             return action
 
         pos = self._extract_agent_xy(obs)
+        heading = self._extract_heading(obs)
 
         a = np.array(action, dtype=np.float32)
         if a.shape[0] < 2:
@@ -179,7 +293,7 @@ class GenericKeepoutShield:
         if norm > self.max_action_norm:
             a_xy = a_xy / (norm + 1e-8) * self.max_action_norm
 
-        next_pos = pos + self.dt * a_xy
+        next_pos = pos + self._predict_displacement(a_xy, heading)
 
         # Find the most conservative safe scale across all violated hazards
         needs_projection = False
@@ -189,12 +303,12 @@ class GenericKeepoutShield:
             if d <= hr:
                 needs_projection = True
                 # Bisection: find the largest t in [0, 1] such that
-                #   ||pos + dt * (t * a_xy) - hazard_center|| >= hr - epsilon
+                #   ||pos + predict(t * a_xy) - hazard_center|| >= hr - epsilon
                 # 20 iterations gives precision ~1e-6, which is more than enough
                 lo, hi = 0.0, 1.0
                 for _ in range(20):
                     mid = 0.5 * (lo + hi)
-                    test_next = pos + self.dt * (mid * a_xy)
+                    test_next = pos + self._predict_displacement(mid * a_xy, heading)
                     if np.linalg.norm(test_next - np.array([hx, hy], dtype=np.float32)) <= (hr - self.epsilon):
                         hi = mid
                     else:
