@@ -116,6 +116,11 @@ def parse_args() -> argparse.Namespace:
         choices=["world_xy", "heading_fit"],
         help="Shield next-position prediction model. Mirrors train.py.",
     )
+    ap.add_argument(
+        "--shield_interior_override",
+        action="store_true",
+        help="Full-authority interior override. Mirrors train.py.",
+    )
     return ap.parse_args()
 
 
@@ -168,6 +173,7 @@ def main():
             alpha=args.shield_alpha,
             influence_radius=args.shield_influence_radius,
             kinematic_model=args.shield_kinematic_model,
+            interior_override=args.shield_interior_override,
         )
         if args.use_shield
         else None

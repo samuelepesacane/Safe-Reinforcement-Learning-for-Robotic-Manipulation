@@ -127,6 +127,91 @@ class TestGenericKeepoutShield(unittest.TestCase):
         self.assertFalse(shield_old.last_intervened)
         np.testing.assert_allclose(safe_action_old, action)
 
+    def test_interior_override_requires_calibration(self) -> None:
+        """interior_override=True must raise at construction without a fit."""
+        with self.assertRaises(ValueError):
+            GenericKeepoutShield(hazards=[(0.0, 0.0, 1.0)], interior_override=True)
+
+    def test_interior_override_is_inert_outside_a_hazard(self) -> None:
+        """
+        Outside any hazard, interior_override must not change behavior at
+        all -- it only fires once the agent's CURRENT position is already
+        inside a hazard.
+        """
+        shield = GenericKeepoutShield(
+            hazards=[(0.0, 0.0, 1.0)],
+            interior_override=True,
+            body_frame_M=np.eye(2, dtype=np.float32),
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        action = np.array([0.1, 0.0], dtype=np.float32)
+        safe_action = shield.step(
+            action, {"agent_pos": np.array([5.0, 5.0], dtype=np.float32), "heading": 0.0}
+        )
+        np.testing.assert_allclose(safe_action, action)
+        self.assertFalse(shield.last_interior_override_fired)
+        self.assertFalse(shield.last_intervened)
+
+    def test_interior_override_replaces_inward_action_with_full_magnitude_outward_one(self) -> None:
+        """
+        With M=I (body frame == world frame for this test), an agent stuck
+        inside a hazard proposing a strongly INWARD action must get that
+        action fully replaced (not blended) with a full-magnitude
+        (max_action_norm) action pointing exactly away from the hazard
+        center -- this is the numeric core of the interior-override design.
+        """
+        hazard = (0.0, 0.0, 1.0)
+        pos = np.array([0.5, 0.0], dtype=np.float32)  # inside: dist 0.5 < radius 1.0
+        shield = GenericKeepoutShield(
+            hazards=[hazard],
+            max_action_norm=1.0,
+            interior_override=True,
+            body_frame_M=np.eye(2, dtype=np.float32),
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        inward_action = np.array([-1.0, 0.0], dtype=np.float32)  # straight toward the center
+        safe_action = shield.step(inward_action, {"agent_pos": pos, "heading": 0.0})
+
+        self.assertTrue(shield.last_interior_override_fired)
+        self.assertTrue(shield.last_intervened)
+        # Full magnitude, not alpha-scaled.
+        self.assertAlmostEqual(float(np.linalg.norm(safe_action[:2])), 1.0, places=5)
+        # Exactly away from the hazard center (+x direction here), not toward it.
+        away_dir = np.array([1.0, 0.0], dtype=np.float32)
+        cos_sim = float(np.dot(safe_action[:2], away_dir))
+        self.assertGreater(cos_sim, 0.999)
+        # This is a REPLACEMENT: the original inward action must play no role.
+        self.assertLess(float(np.dot(safe_action[:2], inward_action)), 0.0)
+
+    def test_interior_override_inverts_a_nontrivial_body_frame_gain(self) -> None:
+        """
+        With a non-identity, non-diagonal M, the override must still point
+        the resulting body-frame displacement (M @ a) toward the true escape
+        direction -- not just copy the escape direction into the action
+        verbatim. Confirms the linear-inversion math, not just the M=I case.
+        """
+        hazard = (0.0, 0.0, 1.0)
+        pos = np.array([0.5, 0.0], dtype=np.float32)
+        heading = 0.0
+        M = np.array([[0.0, 2.0], [1.0, 0.0]], dtype=np.float32)  # swaps + scales axes
+        shield = GenericKeepoutShield(
+            hazards=[hazard],
+            max_action_norm=1.0,
+            interior_override=True,
+            body_frame_M=M,
+            body_frame_b=np.zeros(2, dtype=np.float32),
+        )
+        safe_action = shield.step(
+            np.array([0.0, 0.0], dtype=np.float32), {"agent_pos": pos, "heading": heading}
+        )
+        self.assertAlmostEqual(float(np.linalg.norm(safe_action[:2])), 1.0, places=5)
+        predicted_disp = M @ safe_action[:2]  # heading=0 so body frame == world frame
+        away_dir = np.array([1.0, 0.0], dtype=np.float32)
+        cos_sim = float(
+            np.dot(predicted_disp, away_dir) / (np.linalg.norm(predicted_disp) + 1e-8)
+        )
+        self.assertGreater(cos_sim, 0.999)
+
     def test_extract_agent_xy_raises_on_non_dict_obs(self) -> None:
         """
         D1 (second half): a broken position source must raise, not silently

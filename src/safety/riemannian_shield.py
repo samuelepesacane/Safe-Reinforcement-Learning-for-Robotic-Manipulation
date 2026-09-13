@@ -137,6 +137,7 @@ class RiemannianShield(GenericKeepoutShield):
         kinematic_model: str = "world_xy",
         body_frame_M: Optional[np.ndarray] = None,
         body_frame_b: Optional[np.ndarray] = None,
+        interior_override: bool = False,
     ) -> None:
         super().__init__(
             hazards=hazards,
@@ -146,6 +147,7 @@ class RiemannianShield(GenericKeepoutShield):
             kinematic_model=kinematic_model,
             body_frame_M=body_frame_M,
             body_frame_b=body_frame_b,
+            interior_override=interior_override,
         )
         self.alpha = alpha
         # Only hazards within this extra clearance beyond their radius

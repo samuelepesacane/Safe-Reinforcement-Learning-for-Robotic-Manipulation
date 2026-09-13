@@ -38,6 +38,7 @@ class GenericKeepoutShield:
         kinematic_model: str = "world_xy",
         body_frame_M: Optional[np.ndarray] = None,
         body_frame_b: Optional[np.ndarray] = None,
+        interior_override: bool = False,
     ) -> None:
         """
         Initialize the keepout shield.
@@ -76,12 +77,29 @@ class GenericKeepoutShield:
             Required when kinematic_model == "heading_fit".
             :type body_frame_M: Optional[np.ndarray]
         :param body_frame_b: 2-vector intercept for the body-frame
-            displacement fit. Required when kinematic_model == "heading_fit".
+            displacement fit. Required when kinematic_model == "heading_fit"
+            or interior_override is True.
             :type body_frame_b: Optional[np.ndarray]
+        :param interior_override: If True, whenever the agent's CURRENT
+            position (not a predicted one) is already inside a hazard
+            (clearance <= 0), the proposed action is discarded entirely --
+            not blended -- and replaced with a full-magnitude
+            (max_action_norm) action chosen to maximize outward body-frame
+            displacement, per body_frame_M, away from the
+            deepest-penetrating hazard. This tests whether the interior
+            trap documented in SESSION_HANDOFF.md (car dwell 654-810 steps
+            vs point 15-19) is a consequence of the shield BLENDING a weak
+            correction with the policy's own (often inward-pointing)
+            action, or is inherent to filtering the action space at all --
+            see _interior_override_action. Independent of kinematic_model:
+            the normal (non-interior) prediction path is unaffected: this
+            only replaces what happens once already violating.
+            :type interior_override: bool
 
         :raises ValueError: If kinematic_model is "heading_fit" but
-            body_frame_M or body_frame_b is not supplied, or if
-            kinematic_model is neither "world_xy" nor "heading_fit".
+            body_frame_M or body_frame_b is not supplied, if
+            kinematic_model is neither "world_xy" nor "heading_fit", or if
+            interior_override is True without body_frame_M/body_frame_b.
         """
         self.hazards: List[Tuple[float, float, float]] = hazards if hazards is not None else []
         self.dt: float = dt
@@ -93,12 +111,14 @@ class GenericKeepoutShield:
                 f"Unknown kinematic_model {kinematic_model!r}; expected "
                 "'world_xy' or 'heading_fit'."
             )
-        if kinematic_model == "heading_fit" and (body_frame_M is None or body_frame_b is None):
+        needs_body_frame_fit = kinematic_model == "heading_fit" or interior_override
+        if needs_body_frame_fit and (body_frame_M is None or body_frame_b is None):
             raise ValueError(
-                "kinematic_model='heading_fit' requires body_frame_M and "
-                "body_frame_b (fit via scripts/fit_kinematic_model.py) -- "
-                "failing loudly rather than silently falling back to the "
-                "known-wrong world_xy assumption."
+                "kinematic_model='heading_fit' and/or interior_override=True "
+                "require body_frame_M and body_frame_b (fit via "
+                "scripts/fit_kinematic_model.py) -- failing loudly rather "
+                "than silently falling back to the known-wrong world_xy "
+                "assumption or an untargeted override direction."
             )
         self.kinematic_model: str = kinematic_model
         self.body_frame_M: Optional[np.ndarray] = (
@@ -107,11 +127,13 @@ class GenericKeepoutShield:
         self.body_frame_b: Optional[np.ndarray] = (
             np.asarray(body_frame_b, dtype=np.float32) if body_frame_b is not None else None
         )
+        self.interior_override: bool = interior_override
 
         # Diagnostics: readable by the environment wrapper to log intervention stats
         self.last_intervened: bool = False
         self.interventions_in_episode: int = 0
         self.last_deflection_magnitude: float = 0.0
+        self.last_interior_override_fired: bool = False
 
     def set_hazards(self, hazards: List[Tuple[float, float, float]]) -> None:
         """
@@ -141,6 +163,7 @@ class GenericKeepoutShield:
         self.interventions_in_episode = 0
         self.last_intervened = False
         self.last_deflection_magnitude = 0.0
+        self.last_interior_override_fired = False
 
     def _extract_agent_xy(self, obs: Any) -> np.ndarray:
         """
@@ -248,6 +271,90 @@ class GenericKeepoutShield:
         R = np.array([[c, -s], [s, c]], dtype=np.float32)
         return R @ disp_body
 
+    def _interior_override_action(
+        self, pos: np.ndarray, heading: Optional[float], a: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Full-authority replacement action for when the agent is ALREADY
+        inside a hazard (current clearance <= 0), or None if it is not.
+
+        Ignores the proposed action `a` entirely (this is a replacement, not
+        a blend). Picks the deepest-penetrating hazard (most negative
+        clearance) and computes the world-frame direction directly away from
+        its center, u = (pos - center) / ||pos - center||. Then, using the
+        fitted heading-relative model (body_frame_M, rotated by heading),
+        inverts it to find the FULL-MAGNITUDE action (norm == max_action_norm,
+        not alpha*max_action_norm) whose predicted body-frame displacement is
+        best aligned with u:
+
+            target_body = R(heading)^T @ u          (desired direction, body frame)
+            a* = max_action_norm * (M^T @ target_body) / ||M^T @ target_body||
+
+        a* maximizes (M @ a) . target_body over all a with ||a|| ==
+        max_action_norm (a standard linear-functional-over-a-ball argument),
+        i.e. it is the full-strength action that best drives the fitted model
+        toward the correct escape direction, given the body-frame gain matrix
+        M actually observed for this robot.
+
+        :param pos: Current 2D agent position.
+            :type pos: np.ndarray
+        :param heading: Current yaw in radians. Required (raises if None).
+            :type heading: Optional[float]
+        :param a: Original proposed action (only its non-xy tail, if any, is
+            preserved; components [:2] are fully replaced).
+            :type a: np.ndarray
+
+        :return: The override action, or None if the agent is not currently
+            inside any hazard.
+            :rtype: Optional[np.ndarray]
+
+        :raises ValueError: If heading is None (interior_override requires it
+            regardless of kinematic_model, since it always uses the
+            heading-relative model to invert for the escape direction).
+        """
+        violated = []
+        for (hx, hy, hr) in self.hazards:
+            d = float(np.linalg.norm(pos - np.array([hx, hy], dtype=np.float32)))
+            clearance = d - hr
+            if clearance <= 0.0:
+                violated.append((clearance, hx, hy, d))
+        if not violated:
+            return None
+
+        violated.sort(key=lambda t: t[0])  # most negative (deepest) first
+        _, hx, hy, d = violated[0]
+
+        if d > 1e-6:
+            u = (pos - np.array([hx, hy], dtype=np.float32)) / d
+        else:
+            u = np.array([1.0, 0.0], dtype=np.float32)  # degenerate: exactly at center
+
+        if heading is None:
+            raise ValueError(
+                "interior_override requires a heading (see resolve_heading in "
+                "make_env.py), regardless of kinematic_model, to invert the "
+                "body-frame model for the escape direction -- got None."
+            )
+        c, s = math.cos(heading), math.sin(heading)
+        R = np.array([[c, -s], [s, c]], dtype=np.float32)
+        target_body = R.T @ u
+
+        g = self.body_frame_M.T @ target_body
+        g_norm = float(np.linalg.norm(g))
+        if g_norm > 1e-8:
+            a_xy_override = self.max_action_norm * g / g_norm
+        else:
+            # Degenerate fit (M^T @ target_body ~= 0): fall back to commanding
+            # the desired body-frame direction directly, at full magnitude,
+            # rather than dividing by ~0.
+            a_xy_override = self.max_action_norm * target_body / (
+                np.linalg.norm(target_body) + 1e-8
+            )
+
+        override = np.array(a, dtype=np.float32).copy()
+        override[:2] = a_xy_override
+        return override
+
     def step(self, action: np.ndarray, obs: Any) -> np.ndarray:
         """
         Project a proposed action through the geometric keepout shield.
@@ -272,6 +379,7 @@ class GenericKeepoutShield:
         """
         self.last_intervened = False
         self.last_deflection_magnitude = 0.0
+        self.last_interior_override_fired = False
 
         # No hazards configured: nothing to check. This is the only
         # legitimate pass-through path -- position extraction below always
@@ -285,6 +393,26 @@ class GenericKeepoutShield:
         a = np.array(action, dtype=np.float32)
         if a.shape[0] < 2:
             return action
+
+        # FULL-AUTHORITY INTERIOR OVERRIDE: if the agent's CURRENT position
+        # (not a predicted one) is already inside a hazard, discard the
+        # proposed action entirely -- do not blend it with the override, and
+        # do not run the normal predict-then-bisect logic below at all, since
+        # that logic's own bisection is what degenerates to scale~=0 in this
+        # regime (see SESSION_HANDOFF.md's escape-dynamics finding). This
+        # takes priority over everything else in this method, including any
+        # gradient-stage deflection a RiemannianShield subclass already
+        # applied to `action` before calling here.
+        if self.interior_override:
+            override = self._interior_override_action(pos, heading, a)
+            if override is not None:
+                self.last_intervened = True
+                self.last_interior_override_fired = True
+                self.interventions_in_episode += 1
+                self.last_deflection_magnitude = float(
+                    np.linalg.norm(override[:2] - a[:2])
+                )
+                return override
 
         a_xy = a[:2]
 

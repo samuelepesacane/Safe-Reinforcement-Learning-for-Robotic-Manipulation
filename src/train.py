@@ -127,6 +127,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--shield_interior_override",
+        action="store_true",
+        help=(
+            "Default off. When the agent's CURRENT position is already "
+            "inside a hazard, discard the proposed action entirely (not a "
+            "blend) and replace it with a full-magnitude escape command "
+            "computed by inverting the fitted heading-relative model -- see "
+            "GenericKeepoutShield's interior_override docstring. Requires a "
+            "registered body-frame fit for --env_id (kinematic_fits.py)."
+        ),
+    )
+    ap.add_argument(
         "--use_preferences",
         action="store_true",
         help="Use a learned preference-based reward model instead of env reward.",
@@ -187,6 +199,7 @@ def build_shield_factory(
     alpha: float = 0.1,
     influence_radius: float = 0.5,
     kinematic_model: str = "world_xy",
+    interior_override: bool = False,
 ) -> Callable[[Any], GenericKeepoutShield]:
     """
     Build a factory that constructs a keepout shield for a given env.
@@ -220,6 +233,13 @@ def build_shield_factory(
         (see shield.py's GenericKeepoutShield docstring and
         src/safety/kinematic_fits.py). Ignored for the mujoco: path.
         :type kinematic_model: str
+    :param interior_override: If True, replace (not blend) the action with a
+        full-magnitude escape command whenever the agent's current position
+        is already inside a hazard -- see GenericKeepoutShield's
+        interior_override docstring. Requires a registered body-frame fit for
+        env_id regardless of kinematic_model (fetched the same way
+        "heading_fit" does).
+        :type interior_override: bool
 
     :return: A callable that maps an environment instance to a configured shield.
         :rtype: Callable[[Any], GenericKeepoutShield]
@@ -234,7 +254,7 @@ def build_shield_factory(
         from .safety.riemannian_shield import RiemannianShield
 
     body_frame_M, body_frame_b = (None, None)
-    if kinematic_model == "heading_fit":
+    if kinematic_model == "heading_fit" or interior_override:
         from .safety.kinematic_fits import get_body_frame_fit
         body_frame_M, body_frame_b = get_body_frame_fit(env_id)
 
@@ -253,6 +273,7 @@ def build_shield_factory(
                 kinematic_model=kinematic_model,
                 body_frame_M=body_frame_M,
                 body_frame_b=body_frame_b,
+                interior_override=interior_override,
             )
         else:
             shield = GenericKeepoutShield(
@@ -262,6 +283,7 @@ def build_shield_factory(
                 kinematic_model=kinematic_model,
                 body_frame_M=body_frame_M,
                 body_frame_b=body_frame_b,
+                interior_override=interior_override,
             )
 
         # Load hazards for episode 0. ShieldingActionWrapper.reset() calls the
@@ -419,6 +441,7 @@ def main():
                         alpha=args.shield_alpha,
                         influence_radius=args.shield_influence_radius,
                         kinematic_model=args.shield_kinematic_model,
+                        interior_override=args.shield_interior_override,
                     )
                     if args.use_shield
                     else None
